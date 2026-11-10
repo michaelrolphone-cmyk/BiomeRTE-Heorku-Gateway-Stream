@@ -21,6 +21,13 @@ class ReverseTransportTests(unittest.IsolatedAsyncioTestCase):
     if message.type==WSMsgType.TEXT:await ws.send_str(message.data)
    return ws
   async def snapshot(request):return web.json_response({'entities':['x'*1000]*10000,'complete':True})
+  self.revoked=False
+  async def inspect(request):
+   self.assertEqual(derived(self.secret,'router-inspect'),request.headers['X-Router-Inspect'])
+   value=await request.json()
+   if self.revoked or value['authority']!='owner':raise web.HTTPConflict()
+   return web.json_response({'id':value['session'],'authority':'owner','state':'open'})
+  local.router.add_post('/internal/stream/inspect',inspect)
   local.router.add_post('/api/map/snapshot',snapshot)
   local.router.add_get('/api/state',state);local.router.add_post('/api/controls',stop)
   local.router.add_get('/api/live/{lane}',lane)
@@ -53,6 +60,13 @@ class ReverseTransportTests(unittest.IsolatedAsyncioTestCase):
    self.assertTrue(result['complete']);self.assertEqual(10000,len(result['entities']))
   async with self.client.get(self.public+'/api/state') as r:self.assertEqual(200,r.status)
   self.assertIsNotNone(self.ingress.link)
+ async def test_authoritative_inspection_uses_private_peer_and_fails_closed(self):
+  value=await self.ingress.inspect('owner','session')
+  self.assertEqual('open',value['state'])
+  with self.assertRaises(ConnectionError):await self.ingress.inspect('other-authority','session')
+  self.revoked=True
+  with self.assertRaises(ConnectionError):await self.ingress.inspect('owner','session')
+  self.assertEqual({},self.ingress.pending)
  async def test_independent_live_lanes_and_client_detach_preserve_bridge(self):
   async with self.client.ws_connect(self.public+'/api/live/vision') as vision:
    async with self.client.ws_connect(self.public+'/api/live/control') as control:

@@ -165,6 +165,24 @@ class Ingress:
             if self.link is not None and not self.link.closed:
                 await self.link.send_json({'type':'cancel', 'id':identity})
 
+    async def inspect(self, authority, session):
+        if self.link is None or self.link.closed:
+            raise ConnectionError('Authority bridge disconnected')
+        if len(self.pending)+len(self.lanes)>=self.limit:
+            raise ConnectionError('Authority bridge busy')
+        identity=uuid.uuid4().hex
+        future=asyncio.get_running_loop().create_future()
+        self.pending[identity]=future
+        try:
+            await self.link.send_json({'type':'inspect','id':identity,
+                                      'authority':authority,'session':session})
+            value=await asyncio.wait_for(future,5)
+            if value.get('status')!=200:
+                raise ConnectionError('Authority rejected stream inspection')
+            return value['grant']
+        finally:
+            self.pending.pop(identity,None)
+
     def mount(self, app):
         app.router.add_get('/rover/bridge', self.bridge)
         app.router.add_get('/rover/data/{id}', self.data)
@@ -178,6 +196,7 @@ class Outbound:
         self.headers = {'Authorization':'Bridge ' + derived(secret, 'rover-link')}
         self.site_headers = {'Authorization':'Bearer ' + derived(secret, 'rover-site')}
         self.tasks = {}
+        self.inspect_token = derived(secret,'router-inspect')
 
     async def open(self, session, identity, path):
         async with session.ws_connect(self.local + path, headers=self.site_headers,
@@ -206,6 +225,22 @@ class Outbound:
                 await remote.close(code=1011, message=b'Local HTTP response failed')
                 raise
 
+    async def inspect(self, session, link, value):
+        reply={'id':value['id'],'status':503}
+        try:
+            async with session.post(self.local+'/internal/stream/inspect',
+                json={'authority':value['authority'],'session':value['session']},
+                headers={**self.site_headers,'X-Router-Inspect':self.inspect_token}) as response:
+                body=bytearray()
+                async for chunk in response.content.iter_chunked(4096):
+                    body.extend(chunk)
+                    if len(body)>16384:raise ValueError('Invalid authority reply size')
+                reply['status']=response.status
+                if response.status==200:reply['grant']=json.loads(body)
+        except Exception:
+            pass
+        await link.send_json(reply)
+
     async def run(self):
         async with ClientSession() as session:
             while True:
@@ -221,11 +256,12 @@ class Outbound:
                                 task = self.tasks.pop(identity, None)
                                 if task:
                                     task.cancel()
-                            elif value['type'] in ('open', 'request'):
+                            elif value['type'] in ('open', 'request', 'inspect'):
                                 if len(self.tasks) >= 32 or identity in self.tasks:
                                     continue
                                 coroutine = (self.open(session, identity, value['path'])
-                                    if value['type']=='open' else self.request(session, link, value))
+                                    if value['type']=='open' else self.inspect(session,link,value)
+                                    if value['type']=='inspect' else self.request(session, link, value))
                                 task = asyncio.create_task(coroutine)
                                 self.tasks[identity] = task
                                 def done(task, identity=identity):

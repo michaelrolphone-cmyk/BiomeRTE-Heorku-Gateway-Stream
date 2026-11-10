@@ -2,6 +2,7 @@
 import asyncio
 import contextlib
 import hashlib
+import hmac
 import json
 import logging
 import pathlib
@@ -122,7 +123,22 @@ async def run():
                            'device.outputs.stream:1':'relay6ch.30eda0d95f24'},task='rover-site-server')
     bridge=SiteBridge(rover,derived(secret,'rover-site'),
         {'forward':1,'reverse':2,'left':3,'right':4},snapshot=map_snapshot())
-    runner=web.AppRunner(bridge.app())
+    application=bridge.app()
+    async def inspect_stream(request):
+        if not hmac.compare_digest(request.headers.get('X-Router-Inspect',''),derived(secret,'router-inspect')):
+            raise web.HTTPUnauthorized()
+        value=await request.json()
+        if (not isinstance(value,dict) or set(value)!={'authority','session'} or
+            value['authority']!=app.node or not isinstance(value['session'],str) or
+            len(value['session'])!=32 or any(c not in '0123456789abcdef' for c in value['session'])):
+            raise web.HTTPBadRequest()
+        try:
+            grant=await asyncio.to_thread(app.call,'stream.inspect',{'session':value['session']},uuid.uuid4().hex,realm='site')
+            return web.json_response(grant)
+        except Exception:
+            raise web.HTTPConflict(text='Stream authority unavailable')
+    application.router.add_post('/internal/stream/inspect',inspect_stream)
+    runner=web.AppRunner(application)
     await runner.setup()
     transport=None
     stopped=asyncio.Event()

@@ -30,10 +30,14 @@ def application(config):
     inspect = config['inspect_url']
     if not inspect.startswith('https://'):
         raise ValueError('Authenticated HTTPS stream.inspect URL required')
-    validators = {node:(lambda sid, node=node: _inspect(inspect, sid, node, secrets[node]))
-                  for node in secrets}
-    router = Router(secrets, validators)
     ingress = Ingress(next(iter(secrets.values())))
+    loop=asyncio.get_running_loop()
+    def validate(sid,node):
+        if node==config.get('rover_authority') and ingress.link is not None:
+            return asyncio.run_coroutine_threadsafe(ingress.inspect(node,sid),loop).result(6)
+        return _inspect(inspect,sid,node,secrets[node])
+    validators={node:(lambda sid,node=node:validate(sid,node)) for node in secrets}
+    router=Router(secrets,validators)
     app = web.Application(client_max_size=4096)
     async def health(request):
         return web.json_response({'state':'ready','protocol':'leased-stream-inspect-v1',
