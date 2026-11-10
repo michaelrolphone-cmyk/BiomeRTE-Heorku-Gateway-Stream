@@ -3,7 +3,9 @@ import asyncio
 import contextlib
 import hashlib
 import json
+import logging
 import pathlib
+import signal
 import sys
 import time
 import urllib.request
@@ -60,6 +62,8 @@ class RoutedRemote:
             self.leases[result['id']] = controller
         if operation in ('stream.open','stream.attach'):
             self.sessions[result['id']] = controller
+        if operation == 'stream.list':
+            self.sessions.update({item['id']:controller for item in result})
         if operation == 'stream.close':
             self.sessions.pop(arguments['session'], None)
         if operation == 'cap.release' and result.get('state') == 'released':
@@ -68,6 +72,25 @@ class RoutedRemote:
 
 
 class FreshRover(Rover):
+    def report(self, operation, error):
+        if not hasattr(self,'_reported'):self._reported={}
+        key=(operation,type(error).__name__,str(error)[:200])
+        if time.monotonic()-self._reported.get(key,-100)>30:
+            self._reported[key]=time.monotonic()
+            logging.warning('Rover %s: %s: %s',operation,type(error).__name__,str(error)[:200])
+
+    async def call(self, operation, **args):
+        try:return await super().call(operation,**args)
+        except Exception as error:
+            self.report(operation,error)
+            raise
+
+    async def lane(self, descriptor, lane):
+        try:return await super().lane(descriptor,lane)
+        except Exception as error:
+            self.report(lane,error)
+            raise
+
     def broadcast(self, lane, message):
         if lane == 'vision':
             from biomerte.stream_router import decode
@@ -82,34 +105,16 @@ class FreshRover(Rover):
 
 def map_snapshot():
     from biome_provider import VisionClient
+    from map_snapshot import reader
     client = VisionClient(pathlib.Path.home()/'.local/share/biome-robot-vision/vision.sock', timeout=10)
-    async def snapshot(map_id, revision):
-        if not isinstance(map_id,str) or type(revision) is not int or revision<0:
-            raise web.HTTPBadRequest()
-        entities, cursor, seen, metadata = [], None, set(), None
-        while True:
-            inputs={'map_id':map_id,'revision':revision,'limit':500}
-            if cursor is not None:
-                inputs['cursor']=cursor
-            page=await asyncio.to_thread(client.query,'robot.map.read',inputs)
-            current=page['map']
-            if current.get('map_id',current.get('id'))!=map_id or current['revision']!=revision:
-                raise web.HTTPConflict(text='Map snapshot revision changed')
-            metadata=current
-            entities.extend(page['entities'])
-            cursor=page.get('next_cursor')
-            if not cursor:
-                break
-            if cursor in seen:
-                raise web.HTTPConflict(text='Repeated map cursor')
-            seen.add(cursor)
-        return dict(type='snapshot',map_id=map_id,revision=revision,complete=True,
-                    data=dict(map=metadata,entities=entities,next_cursor=None))
-    return snapshot
+    return reader(client)
 
 
 async def run():
     home=pathlib.Path.home()/'.local/share/biome-rover-server'
+    from logging.handlers import RotatingFileHandler
+    logging.basicConfig(level=logging.WARNING,handlers=[RotatingFileHandler(
+        home/'runtime.log',maxBytes=1048576,backupCount=1)])
     app=Application(str(pathlib.Path.home()/'.local/share/biomerte-controller'))
     secret=app.config['stream_router_secret']
     remote=RoutedRemote(app,home)
@@ -120,14 +125,24 @@ async def run():
     runner=web.AppRunner(bridge.app())
     await runner.setup()
     transport=None
+    stopped=asyncio.Event()
+    loop=asyncio.get_running_loop()
+    for sig in (signal.SIGTERM,signal.SIGINT):
+        loop.add_signal_handler(sig,stopped.set)
+    waiter=None
     try:
         await web.TCPSite(runner,'127.0.0.1',8093).start()
         transport=asyncio.create_task(Outbound(PUBLIC,'http://127.0.0.1:8093',secret).run())
-        await transport
+        waiter=asyncio.create_task(stopped.wait())
+        done,unused=await asyncio.wait((transport,waiter),return_when=asyncio.FIRST_COMPLETED)
+        if transport in done:await transport
     finally:
         if transport:
             transport.cancel()
             with contextlib.suppress(asyncio.CancelledError):await transport
+        if waiter:
+            waiter.cancel()
+            with contextlib.suppress(asyncio.CancelledError):await waiter
         await runner.cleanup()
 
 if __name__=='__main__':
