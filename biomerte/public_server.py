@@ -38,15 +38,22 @@ def application(config):
         return _inspect(inspect,sid,node,secrets[node])
     validators={node:(lambda sid,node=node:validate(sid,node)) for node in secrets}
     router=Router(secrets,validators)
+    owner=config.get('router_owner','hosted')
+    if owner not in ('hosted','mac_bridge'):
+        raise ValueError('Unknown native session owner')
     app = web.Application(client_max_size=4096)
     async def health(request):
         return web.json_response({'state':'ready','protocol':'leased-stream-inspect-v1',
             'authorities':sorted(secrets),'sessions':len(router.sessions),
             'rover_bridge':ingress.link is not None,
+            'session_owner':owner,
+            'native_owner_connected':'native_router' in ingress.capabilities,
             'owner_inspection_configured':bool(config.get('rover_authority')),
             'owner_inspection_connected':bool(config.get('rover_authority') and ingress.link is not None),
             'stream_peers':{node:sum(len(session.peers) for session in router.sessions.values() if session.grant['authority']==node) for node in secrets}})
     async def stream(request):
+        if owner=='mac_bridge':
+            return await ingress.native(request)
         socket = web.WebSocketResponse(heartbeat=15, max_msg_size=4194304,
                                        writer_limit=65536)
         await socket.prepare(request)

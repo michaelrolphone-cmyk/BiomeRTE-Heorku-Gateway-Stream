@@ -6,6 +6,7 @@ def main():
  p.add_argument('--runtime',required=True,type=pathlib.Path)
  p.add_argument('--vision',required=True,type=pathlib.Path)
  p.add_argument('--python',required=True,type=pathlib.Path)
+ p.add_argument('--local-router-url')
  a=p.parse_args();source=pathlib.Path(__file__).resolve().parent.parent
  for x in (a.runtime/'biomerte/rover.py',a.vision/'providers/robot-vision/biome_provider.py',a.python):
   if not x.exists():raise SystemExit('Required runtime input unavailable: '+str(x))
@@ -17,6 +18,11 @@ def main():
   WorkingDirectory=str(source/'mac'),EnvironmentVariables={'HOME':str(pathlib.Path.home()),
   'PYTHONPATH':os.pathsep.join(map(str,paths))},RunAtLoad=True,KeepAlive=True,
   StandardOutPath=str(home/'service.log'),StandardErrorPath=str(home/'service-error.log'),Umask=63)
+ if a.local_router_url:
+  import sys
+  sys.path.insert(0,str(source/'biomerte'))
+  from rover_transport import local_router
+  value['EnvironmentVariables']['BIOMERTE_LOCAL_STREAM_ROUTER']=local_router(a.local_router_url)
  target.write_bytes(plistlib.dumps(value));os.chmod(target,0o600)
  domain='gui/'+str(os.getuid())
  subprocess.run(['launchctl','bootout',domain,str(target)],capture_output=True)
