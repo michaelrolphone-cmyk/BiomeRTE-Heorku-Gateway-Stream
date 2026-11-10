@@ -1,0 +1,179 @@
+"""Authenticated Site adapter for biomerte.rover.Rover (Python 3.9+).
+
+Native leases belong to Rover.start/close, never a browser subscription. This
+adapter deliberately has no controller polling or per-message persistence.
+"""
+import asyncio
+import contextlib
+import hmac
+import json
+import time
+import uuid
+from aiohttp import web
+
+
+class SiteBridge:
+    def __init__(self, rover, token, channels, snapshot=None):
+        if not isinstance(token, str) or len(token) < 32:
+            raise ValueError('A private bridge token of at least 32 characters is required')
+        if (set(channels) != {'forward', 'reverse', 'left', 'right'} or
+                any(type(n) is not int or not 1 <= n <= 6 for n in channels.values()) or
+                len(set(channels.values())) != 4):
+            raise ValueError('Four distinct physical direction channels are required')
+        self.rover, self.token, self.channels = rover, token, dict(channels)
+        self.snapshot = snapshot
+        self.epoch = uuid.uuid4().hex
+        self.stop_generation = 0
+        self.clients = set()
+        self.monitor = None
+        self.signature = None
+
+    def state(self):
+        return dict(type='state', epoch=self.epoch, stop_generation=self.stop_generation,
+                    ready=bool(self.rover.control_ready), channels=self.channels,
+                    server_time=time.time(), lease_owner='server',
+                    native={k:self.rover.descriptors.get('device.outputs.stream:1', {}).get(k)
+                            for k in ('authority', 'generation', 'epoch')})
+
+    def synchronize(self):
+        # A lost native control connection invalidates every browser's old input.
+        descriptor = self.rover.descriptors.get('device.outputs.stream:1', {})
+        signature = (bool(self.rover.control_ready), descriptor.get('epoch'))
+        if signature != self.signature:
+            self.signature = signature
+            self.epoch = uuid.uuid4().hex
+            self.stop_generation += 1
+            self.rover.discard_intent()
+            self.broadcast(self.state())
+
+    def broadcast(self, value):
+        for queue in self.clients:
+            if queue.full():
+                queue.get_nowait()
+            queue.put_nowait(value)
+
+    def stop(self):
+        self.stop_generation += 1
+        self.rover.discard_intent()
+        receipt = self.rover.stop() if self.rover.control_ready else None
+        value = dict(self.state(), accepted=receipt, applied=False)
+        self.broadcast(value)
+        return value
+
+    def accept(self, value, previous):
+        self.synchronize()
+        seq = value.get('sequence')
+        if type(seq) is not int or seq <= previous:
+            raise ValueError('Old or duplicate browser sequence')
+        if value.get('type') == 'stop':
+            return seq, self.stop()
+        if value.get('type') != 'intent':
+            raise ValueError('Unknown browser stream message')
+        if value.get('epoch') != self.epoch or value.get('stop_generation') != self.stop_generation:
+            raise ValueError('Superseded browser control epoch')
+        issued = value.get('issued_at')
+        if type(issued) not in (int, float) or not 0 <= time.time() - issued <= .5:
+            raise ValueError('Expired browser intent')
+        directions = value.get('directions')
+        if (not isinstance(directions, dict) or set(directions) != set(self.channels) or
+                any(type(v) is not bool for v in directions.values())):
+            raise ValueError('Expected four Boolean directions')
+        desired = dict(directions)
+        for a, b in (('forward', 'reverse'), ('left', 'right')):
+            if desired[a] and desired[b]:
+                desired[a] = desired[b] = False
+        mask = sum(1 << (self.channels[k] - 1) for k, active in desired.items() if active)
+        receipt = self.rover.desired(mask, 250)
+        return seq, dict(type='accepted', browser_sequence=seq, **receipt)
+
+    async def watch(self):
+        while True:
+            self.synchronize()
+            await asyncio.sleep(.1)
+
+    def app(self):
+        @web.middleware
+        async def authenticate(request, handler):
+            supplied = request.headers.get('Authorization', '')
+            if not hmac.compare_digest(supplied, 'Bearer ' + self.token):
+                raise web.HTTPUnauthorized()
+            # Only the Site Worker has this token. It authenticates its users
+            # and checks their browser origin before forwarding any request.
+            return await handler(request)
+
+        async def state(request):
+            self.synchronize()
+            return web.json_response(self.state())
+
+        async def controls(request):
+            body = await request.json()
+            if body != {'stop': True}:
+                raise web.HTTPBadRequest(text='Directions require the live socket')
+            return web.json_response(self.stop())
+
+        async def snapshot(request):
+            if self.snapshot is None:
+                return web.json_response({'error': {'code': 'MAP_SNAPSHOT_UNAVAILABLE',
+                    'message': 'A revision-pinned map snapshot adapter is not configured.'}}, status=503)
+            body = await request.json()
+            # Backend callback must return a complete map pinned to map_id and
+            # revision, or reject. Never substitute unpinned retained geometry.
+            value = await self.snapshot(body.get('map_id'), body.get('revision'))
+            return web.json_response(value)
+
+        async def live(request):
+            lane = request.match_info['lane']
+            if lane not in ('vision', 'map', 'control'):
+                raise web.HTTPNotFound()
+            socket = web.WebSocketResponse(heartbeat=20, max_msg_size=4096)
+            await socket.prepare(request)
+            status_queue = asyncio.Queue(1)
+            if lane == 'control':
+                self.clients.add(status_queue)
+                self.synchronize()
+                if status_queue.empty():status_queue.put_nowait(self.state())
+            async with self.rover.subscribe() as queues:
+                async def send(queue):
+                    while True:
+                        value = await queue.get()
+                        if isinstance(value, bytes):await socket.send_bytes(value)
+                        elif isinstance(value, str):await socket.send_str(value)
+                        else:await socket.send_json(value)
+                async def receive():
+                    previous = -1
+                    async for message in socket:
+                        if lane != 'control':continue
+                        if message.type != web.WSMsgType.TEXT:continue
+                        try:
+                            previous, receipt = self.accept(json.loads(message.data), previous)
+                            await socket.send_json(receipt)
+                        except (ValueError, KeyError, TypeError, RuntimeError):
+                            await socket.send_json({'type': 'rejected', 'message': 'Control unavailable, stale or invalid; release and press again.'})
+                tasks = [asyncio.create_task(send(queues[lane])), asyncio.create_task(receive())]
+                if lane == 'control':tasks.append(asyncio.create_task(send(status_queue)))
+                try:
+                    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                    for task in done:task.result()
+                finally:
+                    self.clients.discard(status_queue)
+                    for task in tasks:task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
+            return socket
+
+        app = web.Application(middlewares=[authenticate], client_max_size=4096)
+        app.router.add_get('/api/state', state)
+        app.router.add_post('/api/controls', controls)
+        app.router.add_post('/api/map/snapshot', snapshot)
+        app.router.add_get('/api/live/{lane}', live)
+        async def start(app):
+            await self.rover.start()
+            self.monitor = asyncio.create_task(self.watch())
+        async def close(app):
+            if self.monitor:
+                self.monitor.cancel()
+                with contextlib.suppress(asyncio.CancelledError):await self.monitor
+            await self.rover.close()
+        app.on_startup.append(start)
+        app.on_cleanup.append(close)
+        return app
+
