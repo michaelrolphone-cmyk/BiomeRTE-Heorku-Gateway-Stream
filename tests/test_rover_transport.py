@@ -1,6 +1,13 @@
 import asyncio,contextlib,unittest
 from aiohttp import web,ClientSession,WSMsgType
-from biomerte.rover_transport import Ingress,Outbound,derived
+from biomerte.rover_transport import Ingress,Outbound,derived,local_router
+
+
+class LocalRouterTests(unittest.TestCase):
+ def test_plaintext_attachment_override_is_loopback_only(self):
+  self.assertEqual('ws://127.0.0.1:8751',local_router('ws://127.0.0.1:8751/'))
+  for value in ('ws://public.example','http://localhost','ws://localhost/path','ws://user@localhost','ws://localhost?x=1'):
+   with self.assertRaises(ValueError):local_router(value)
 
 
 class ReverseTransportTests(unittest.IsolatedAsyncioTestCase):
