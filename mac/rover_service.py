@@ -16,7 +16,7 @@ from aiohttp import web
 from biomerte.app import Application, read_json
 from biomerte.identity import sign
 from biomerte.rover import Rover
-from rover_transport import Outbound, derived
+from rover_transport import Outbound, derived, local_router
 from site_bridge import SiteBridge
 
 MAC='217339021b2b3d61b16660da5562889be8e57e0636bdd9a5d129e3570c67ae4b'
@@ -88,6 +88,8 @@ class FreshRover(Rover):
             raise
 
     async def lane(self, descriptor, lane):
+        if getattr(self,'local_router',None):
+            descriptor={**descriptor,'url':self.local_router+'/'+descriptor['id']}
         try:return await super().lane(descriptor,lane)
         except Exception as error:
             self.report(lane,error)
@@ -122,6 +124,7 @@ async def run():
     remote=RoutedRemote(app,home)
     rover=FreshRover(remote,{'robot.vision.stream:1':'robotvision.mac.ae3c74c06d1909a1ccdc',
                            'device.outputs.stream:1':'relay6ch.30eda0d95f24'},task='rover-site-server')
+    rover.local_router=local_router(os.environ.get('BIOMERTE_LOCAL_STREAM_ROUTER'))
     bridge=SiteBridge(rover,derived(secret,'rover-site'),
         {'forward':1,'reverse':2,'left':3,'right':4},snapshot=map_snapshot(),
         intent_ttl_ms=int(os.environ.get('ROVER_INTENT_TTL_MS','500')))
@@ -150,7 +153,7 @@ async def run():
     waiter=None
     try:
         await web.TCPSite(runner,'127.0.0.1',8093).start()
-        transport=asyncio.create_task(Outbound(PUBLIC,'http://127.0.0.1:8093',secret).run())
+        transport=asyncio.create_task(Outbound(PUBLIC,'http://127.0.0.1:8093',secret,rover.local_router).run())
         waiter=asyncio.create_task(stopped.wait())
         done,unused=await asyncio.wait((transport,waiter),return_when=asyncio.FIRST_COMPLETED)
         if transport in done:await transport

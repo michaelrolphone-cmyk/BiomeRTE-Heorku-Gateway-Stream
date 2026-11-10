@@ -21,6 +21,7 @@ def build_config(environ=None):
     return {'listen':'0.0.0.0', 'port':int(env.get('PORT','8751')),
         'secrets':{node:secret for node in nodes},
         'rover_authority':deployment.get('rover_authority'),
+        'router_owner':env.get('STREAM_ROUTER_OWNER') or deployment.get('router_owner','hosted'),
         'inspect_url':env.get('STREAM_INSPECT_URL') or deployment['inspect_url']}
 
 def main():

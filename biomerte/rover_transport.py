@@ -8,12 +8,25 @@ import contextlib
 import hashlib
 import hmac
 import json
+import re
 import uuid
+from urllib.parse import urlsplit
 from aiohttp import web, ClientSession, WSMsgType, ClientError
 
 
 def derived(secret, purpose):
     return hmac.new(secret.encode(), purpose.encode(), hashlib.sha256).hexdigest()
+
+
+def local_router(value):
+    if value is None:
+        return None
+    parsed = urlsplit(value)
+    if (parsed.scheme != 'ws' or parsed.hostname not in ('127.0.0.1', '::1', 'localhost')
+        or parsed.username or parsed.password or parsed.path not in ('', '/')
+        or parsed.query or parsed.fragment):
+        raise ValueError('Native router must be a loopback WebSocket listener')
+    return value.rstrip('/')
 
 
 async def copy_socket(source, target):
@@ -46,6 +59,7 @@ class Ingress:
         self.key = derived(secret, 'rover-link')
         self.site_token = derived(secret, 'rover-site')
         self.link = None
+        self.capabilities = set()
         self.pending = {}
         self.lanes = {}
         self.active = set()
@@ -62,6 +76,7 @@ class Ingress:
         socket = web.WebSocketResponse(heartbeat=15, max_msg_size=4194304)
         await socket.prepare(request)
         self.link = socket
+        self.capabilities = set(request.headers.get('X-Bridge-Capabilities', '').split(','))
         try:
             async for message in socket:
                 if message.type != WSMsgType.TEXT:
@@ -72,6 +87,7 @@ class Ingress:
                     future.set_result(value)
         finally:
             self.link = None
+            self.capabilities.clear()
             for future in list(self.pending.values()) + list(self.lanes.values()):
                 if not future.done():
                     future.set_exception(ConnectionError('Rover bridge disconnected'))
@@ -110,27 +126,7 @@ class Ingress:
         if path.startswith('/api/live/'):
             if request.headers.get('Upgrade', '').lower() != 'websocket':
                 raise web.HTTPBadRequest()
-            self.lanes[identity] = future
-            finished = None
-            try:
-                await self.link.send_json({'type': 'open', 'id': identity, 'path': path})
-                upstream, finished = await asyncio.wait_for(future, 10)
-                socket = web.WebSocketResponse(heartbeat=15, max_msg_size=4096,
-                                               writer_limit=65536)
-                await socket.prepare(request)
-                self.active.update((upstream, socket))
-                try:
-                    await splice(upstream, socket)
-                finally:
-                    self.active.discard(upstream)
-                    self.active.discard(socket)
-                return socket
-            finally:
-                self.lanes.pop(identity, None)
-                if finished is not None and not finished.done():
-                    finished.set_result(None)
-                if self.link is not None and not self.link.closed:
-                    await self.link.send_json({'type':'cancel', 'id':identity})
+            return await self.live(request, {'type':'open','path':path}, 4096)
         if request.method not in ('GET', 'POST'):
             raise web.HTTPMethodNotAllowed(request.method, ('GET', 'POST'))
         body = await request.read()
@@ -165,6 +161,47 @@ class Ingress:
             if self.link is not None and not self.link.closed:
                 await self.link.send_json({'type':'cancel', 'id':identity})
 
+    async def native(self, request):
+        authorization = request.headers.get('Authorization', '')
+        if not re.fullmatch(r'Stream [A-Za-z0-9_-]{1,22000}\.[a-f0-9]{64}', authorization):
+            raise web.HTTPUnauthorized()
+        if 'native_router' not in self.capabilities:
+            raise web.HTTPServiceUnavailable(text='Native session owner disconnected')
+        return await self.live(request, {'type':'native_open','path':request.path,
+                                        'authorization':authorization}, 4194304)
+
+    async def live(self, request, notice, maximum):
+        if request.headers.get('Upgrade', '').lower() != 'websocket':
+            raise web.HTTPBadRequest()
+        if self.link is None or self.link.closed:
+            raise web.HTTPServiceUnavailable()
+        if len(self.pending) + len(self.lanes) >= self.limit:
+            raise web.HTTPTooManyRequests()
+        identity = uuid.uuid4().hex
+        future = asyncio.get_running_loop().create_future()
+        self.lanes[identity] = future
+        finished = upstream = None
+        try:
+            await self.link.send_json({**notice,'id':identity})
+            upstream, finished = await asyncio.wait_for(future, 10)
+            socket = web.WebSocketResponse(heartbeat=15, max_msg_size=maximum, writer_limit=65536)
+            await socket.prepare(request)
+            self.active.update((upstream, socket))
+            try:
+                await splice(upstream, socket)
+            finally:
+                self.active.discard(upstream)
+                self.active.discard(socket)
+            return socket
+        finally:
+            self.lanes.pop(identity, None)
+            if finished is not None and not finished.done():
+                finished.set_result(None)
+            if upstream is not None:
+                await upstream.close()
+            if self.link is not None and not self.link.closed:
+                await self.link.send_json({'type':'cancel', 'id':identity})
+
     async def inspect(self, authority, session):
         if self.link is None or self.link.closed:
             raise ConnectionError('Authority bridge disconnected')
@@ -190,13 +227,26 @@ class Ingress:
 
 
 class Outbound:
-    def __init__(self, public, local, secret):
+    def __init__(self, public, local, secret, native_router=None):
         self.public = public.rstrip('/')
         self.local = local.rstrip('/')
         self.headers = {'Authorization':'Bridge ' + derived(secret, 'rover-link')}
         self.site_headers = {'Authorization':'Bearer ' + derived(secret, 'rover-site')}
         self.tasks = {}
         self.inspect_token = derived(secret,'router-inspect')
+        self.native_router = local_router(native_router)
+        if self.native_router:
+            self.headers['X-Bridge-Capabilities'] = 'native_router,owner_inspect'
+
+    async def open_native(self, session, value):
+        if not self.native_router or not re.fullmatch(r'/[a-f0-9]{32}/[a-z_]+', value['path']):
+            raise ValueError('Invalid native stream path')
+        async with session.ws_connect(self.native_router + value['path'],
+            headers={'Authorization':value['authorization']}, heartbeat=15,
+            max_msg_size=4194304) as local:
+            async with session.ws_connect(self.public + '/rover/data/' + value['id'],
+                headers=self.headers, heartbeat=15, max_msg_size=4194304) as remote:
+                await splice(local, remote)
 
     async def open(self, session, identity, path):
         async with session.ws_connect(self.local + path, headers=self.site_headers,
@@ -256,10 +306,11 @@ class Outbound:
                                 task = self.tasks.pop(identity, None)
                                 if task:
                                     task.cancel()
-                            elif value['type'] in ('open', 'request', 'inspect'):
+                            elif value['type'] in ('open', 'request', 'inspect', 'native_open'):
                                 if len(self.tasks) >= 32 or identity in self.tasks:
                                     continue
-                                coroutine = (self.open(session, identity, value['path'])
+                                coroutine = (self.open_native(session, value)
+                                    if value['type']=='native_open' else self.open(session, identity, value['path'])
                                     if value['type']=='open' else self.inspect(session,link,value)
                                     if value['type']=='inspect' else self.request(session, link, value))
                                 task = asyncio.create_task(coroutine)
