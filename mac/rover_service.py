@@ -5,6 +5,7 @@ import hashlib
 import hmac
 import json
 import logging
+import os
 import pathlib
 import signal
 import sys
@@ -122,7 +123,8 @@ async def run():
     rover=FreshRover(remote,{'robot.vision.stream:1':'robotvision.mac.ae3c74c06d1909a1ccdc',
                            'device.outputs.stream:1':'relay6ch.30eda0d95f24'},task='rover-site-server')
     bridge=SiteBridge(rover,derived(secret,'rover-site'),
-        {'forward':1,'reverse':2,'left':3,'right':4},snapshot=map_snapshot())
+        {'forward':1,'reverse':2,'left':3,'right':4},snapshot=map_snapshot(),
+        intent_ttl_ms=int(os.environ.get('ROVER_INTENT_TTL_MS','500')))
     application=bridge.app()
     async def inspect_stream(request):
         if not hmac.compare_digest(request.headers.get('X-Router-Inspect',''),derived(secret,'router-inspect')):

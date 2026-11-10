@@ -62,11 +62,11 @@ Also allow secrets to be supplied without local controller directories (see `her
    ```json
    {
      "stream_router_secret": "<same secret>",
-     "stream_gateway_url": "wss://<your-gateway>/api/stream"
+     "stream_gateway_url": "wss://<app-name>.herokuapp.com"
    }
    ```
 
-Providers and the Rover server continue to dial the gateway. The gateway proxies to this dyno.
+Native provider/server sockets may dial this dyno directly at `/<session>/<lane>`, using the controller-issued Stream credential. The gateway `/api/stream` proxy remains supported.
 
 ## Layout
 
@@ -82,3 +82,12 @@ biomerte/heroku_stream_router.py   generates config from env and starts the rout
 - Session state is in-process. A dyno restart drops live sessions; clients re-attach under the existing lease and epoch rules.
 - One dyno only. Multiple dynos need sticky routing or shared session state, which the current router does not have.
 - If Heroku is unreachable from the field, streaming stops. Discrete capability leases and destinations do not depend on this dyno.
+
+## Rover intent lifetime
+
+The paired Mac service uses a configurable 500 ms desired-state lifetime. Set
+`ROVER_INTENT_TTL_MS` on that service to an integer from 20 through 1000 ms.
+Directions and neutral use the same policy. This accommodates measured public
+transport delay and clock uncertainty; the router and provider still reject
+expired input and enforce the one-second maximum. Keep host clocks synchronized
+with NTP. A server acceptance is separate from provider received/applied feedback.
