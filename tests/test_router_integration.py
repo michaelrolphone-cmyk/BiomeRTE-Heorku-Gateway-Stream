@@ -34,6 +34,7 @@ class ConfigTests(unittest.TestCase):
   self.assertEqual(NODE,body['authority']);self.assertEqual('b'*32,body['session'])
   self.assertLess(abs(time.time()-body['timestamp']),1)
   self.assertEqual('Router '+hmac.new(SECRET.encode(),r.data,hashlib.sha256).hexdigest(),r.headers['Authorization'])
+  self.assertEqual('BiomeRTE-Stream-Router/1',r.headers['User-agent'])
  def test_credential_unknown_or_expired_authority_fails(self):
   g=grant();self.assertEqual(NODE,credential(token(g),{NODE:SECRET})['authority'])
   with self.assertRaises(Fault):credential(token(g),{})

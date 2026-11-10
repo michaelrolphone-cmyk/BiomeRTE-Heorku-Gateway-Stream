@@ -228,7 +228,8 @@ def _inspect(url, session_id, authority, secret):
     raw = encode({'session': session_id, 'authority': authority, 'timestamp': time.time()}).encode()
     signature = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
     req = urllib.request.Request(url, data=raw,
-        headers={'Content-Type': 'application/json', 'Authorization': 'Router ' + signature})
+        headers={'Content-Type': 'application/json', 'Authorization': 'Router ' + signature,
+                 'User-Agent': 'BiomeRTE-Stream-Router/1'})
     with urllib.request.urlopen(req, timeout=5) as resp:
         return json.loads(resp.read().decode())
 
