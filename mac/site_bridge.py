@@ -13,13 +13,16 @@ from aiohttp import web
 
 
 class SiteBridge:
-    def __init__(self, rover, token, channels, snapshot=None):
+    def __init__(self, rover, token, channels, snapshot=None, intent_ttl_ms=500):
         if not isinstance(token, str) or len(token) < 32:
             raise ValueError('A private bridge token of at least 32 characters is required')
         if (set(channels) != {'forward', 'reverse', 'left', 'right'} or
                 any(type(n) is not int or not 1 <= n <= 6 for n in channels.values()) or
                 len(set(channels.values())) != 4):
             raise ValueError('Four distinct physical direction channels are required')
+        if type(intent_ttl_ms) is not int or not 20 <= intent_ttl_ms <= 1000:
+            raise ValueError('Fresh intent lifetime must be 20..1000 milliseconds')
+        self.intent_ttl_ms = intent_ttl_ms
         self.rover, self.token, self.channels = rover, token, dict(channels)
         self.snapshot = snapshot
         self.epoch = uuid.uuid4().hex
@@ -31,7 +34,7 @@ class SiteBridge:
     def state(self):
         return dict(type='state', epoch=self.epoch, stop_generation=self.stop_generation,
                     ready=bool(self.rover.control_ready), channels=self.channels,
-                    server_time=time.time(), lease_owner='server',
+                    server_time=time.time(), lease_owner='server', intent_ttl_ms=self.intent_ttl_ms,
                     native={k:self.rover.descriptors.get('device.outputs.stream:1', {}).get(k)
                             for k in ('authority', 'generation', 'epoch')})
 
@@ -55,7 +58,7 @@ class SiteBridge:
     def stop(self):
         self.stop_generation += 1
         self.rover.discard_intent()
-        receipt = self.rover.stop() if self.rover.control_ready else None
+        receipt = self.rover.desired(0, self.intent_ttl_ms) if self.rover.control_ready else None
         value = dict(self.state(), accepted=receipt, applied=False)
         self.broadcast(value)
         return value
@@ -83,7 +86,7 @@ class SiteBridge:
             if desired[a] and desired[b]:
                 desired[a] = desired[b] = False
         mask = sum(1 << (self.channels[k] - 1) for k, active in desired.items() if active)
-        receipt = self.rover.desired(mask, 250)
+        receipt = self.rover.desired(mask, self.intent_ttl_ms)
         return seq, dict(type='accepted', browser_sequence=seq, **receipt)
 
     async def watch(self):

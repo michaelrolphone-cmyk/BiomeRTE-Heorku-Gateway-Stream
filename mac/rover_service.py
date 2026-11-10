@@ -126,7 +126,8 @@ async def run():
                            'device.outputs.stream:1':'relay6ch.30eda0d95f24'},task='rover-site-server')
     rover.local_router=local_router(os.environ.get('BIOMERTE_LOCAL_STREAM_ROUTER'))
     bridge=SiteBridge(rover,derived(secret,'rover-site'),
-        {'forward':1,'reverse':2,'left':3,'right':4},snapshot=map_snapshot())
+        {'forward':1,'reverse':2,'left':3,'right':4},snapshot=map_snapshot(),
+        intent_ttl_ms=int(os.environ.get('ROVER_INTENT_TTL_MS','500')))
     application=bridge.app()
     async def inspect_stream(request):
         if not hmac.compare_digest(request.headers.get('X-Router-Inspect',''),derived(secret,'router-inspect')):
