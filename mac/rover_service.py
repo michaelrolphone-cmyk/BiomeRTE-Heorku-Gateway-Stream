@@ -125,6 +125,10 @@ async def run():
     rover=FreshRover(remote,{'robot.vision.stream:1':'robotvision.mac.ae3c74c06d1909a1ccdc',
                            'device.outputs.stream:1':'relay6ch.30eda0d95f24'},task='rover-site-server')
     rover.local_router=local_router(os.environ.get('BIOMERTE_LOCAL_STREAM_ROUTER'))
+    if rover.local_router:
+        if not hasattr(rover,'require_provider_ready'):
+            raise RuntimeError('Native runtime requires versioned provider-peer readiness support')
+        rover.require_provider_ready=True
     bridge=SiteBridge(rover,derived(secret,'rover-site'),
         {'forward':1,'reverse':2,'left':3,'right':4},snapshot=map_snapshot(),
         intent_ttl_ms=int(os.environ.get('ROVER_INTENT_TTL_MS','500')))

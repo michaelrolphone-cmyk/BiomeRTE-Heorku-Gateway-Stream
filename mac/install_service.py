@@ -8,6 +8,9 @@ def main():
  p.add_argument('--python',required=True,type=pathlib.Path)
  p.add_argument('--local-router-url')
  a=p.parse_args();source=pathlib.Path(__file__).resolve().parent.parent
+ if a.local_router_url:
+  env={**os.environ,'PYTHONPATH':str(a.runtime)}
+  subprocess.run([str(a.python),'-c','from biomerte.rover import Rover; assert hasattr(Rover(None,{}), "require_provider_ready"), "Runtime lacks provider peer readiness"'],env=env,check=True)
  for x in (a.runtime/'biomerte/rover.py',a.vision/'providers/robot-vision/biome_provider.py',a.python):
   if not x.exists():raise SystemExit('Required runtime input unavailable: '+str(x))
  home=pathlib.Path.home()/'.local/share/biome-rover-server';home.mkdir(mode=0o700,parents=True,exist_ok=True)
