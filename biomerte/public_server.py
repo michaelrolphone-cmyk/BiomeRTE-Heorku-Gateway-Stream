@@ -42,7 +42,10 @@ def application(config):
     async def health(request):
         return web.json_response({'state':'ready','protocol':'leased-stream-inspect-v1',
             'authorities':sorted(secrets),'sessions':len(router.sessions),
-            'rover_bridge':ingress.link is not None})
+            'rover_bridge':ingress.link is not None,
+            'owner_inspection_configured':bool(config.get('rover_authority')),
+            'owner_inspection_connected':bool(config.get('rover_authority') and ingress.link is not None),
+            'stream_peers':{node:sum(len(session.peers) for session in router.sessions.values() if session.grant['authority']==node) for node in secrets}})
     async def stream(request):
         socket = web.WebSocketResponse(heartbeat=15, max_msg_size=4194304,
                                        writer_limit=65536)
