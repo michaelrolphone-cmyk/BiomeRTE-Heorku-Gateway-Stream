@@ -3,6 +3,7 @@ import asyncio
 from aiohttp import web, WSMsgType
 from .stream_router import Router, _inspect
 from .rover_transport import Ingress
+from .authority_transport import Authorities
 
 
 class Socket:
@@ -31,6 +32,7 @@ def application(config):
     if not inspect.startswith('https://'):
         raise ValueError('Authenticated HTTPS stream.inspect URL required')
     ingress = Ingress(next(iter(secrets.values())))
+    authorities = Authorities(secrets)
     loop=asyncio.get_running_loop()
     def validate(sid,node):
         if node==config.get('rover_authority') and ingress.link is not None:
@@ -44,7 +46,8 @@ def application(config):
     app = web.Application(client_max_size=4096)
     async def health(request):
         return web.json_response({'state':'ready','protocol':'leased-stream-inspect-v1',
-            'authorities':sorted(secrets),'sessions':len(router.sessions),
+            'authorities':sorted(secrets),
+            'authority_inspection_links':sorted(authorities.links),'sessions':len(router.sessions),
             'rover_bridge':ingress.link is not None,
             'session_owner':owner,
             'native_owner_connected':'native_router' in ingress.capabilities,
@@ -65,8 +68,10 @@ def application(config):
         return socket
     app.router.add_get('/health', health)
     ingress.mount(app)
+    authorities.mount(app)
     app.router.add_get('/{session:[a-f0-9]{32}}/{lane:[a-z_]+}', stream)
     async def close(app):
+        await authorities.close()
         await asyncio.gather(*(s.close('Router stopped') for s in list(router.sessions.values())),
                              return_exceptions=True)
         tasks = list(router.tasks.values())
