@@ -4,7 +4,7 @@ import json
 import os
 import pathlib
 import sys
-from biomerte.stream_router import serve
+from biomerte.public_server import serve
 
 def build_config(environ=None):
     env = os.environ if environ is None else environ
@@ -31,3 +31,4 @@ def main():
 
 if __name__=='__main__':
     main()
+
