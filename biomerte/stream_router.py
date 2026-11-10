@@ -224,16 +224,13 @@ class Router:
             await peer.close(1000, 'Detached')
 
 
-def _inspect(url, session_id):
-    req = urllib.request.Request(url, data=json.dumps({'session': session_id}).encode(),
-                                 headers={'Content-Type': 'application/json'})
+def _inspect(url, session_id, authority, secret):
+    raw = encode({'session': session_id, 'authority': authority, 'timestamp': time.time()}).encode()
+    signature = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+    req = urllib.request.Request(url, data=raw,
+        headers={'Content-Type': 'application/json', 'Authorization': 'Router ' + signature})
     with urllib.request.urlopen(req, timeout=5) as resp:
         return json.loads(resp.read().decode())
-
-
-def _accept(grant_id):
-    # Used only when no inspect URL is configured. Signature already checked.
-    return {'id': grant_id, 'state': 'open'}
 
 
 async def serve(config):
@@ -241,16 +238,21 @@ async def serve(config):
     secrets = dict(config.get('secrets') or {})
     validators = {}
     inspect = config.get('inspect_url') or ''
+    if not inspect.startswith('https://'):
+        raise ValueError('Authenticated HTTPS stream.inspect URL is required')
     for node in secrets:
-        if inspect:
-            validators[node] = lambda sid, url=inspect: _inspect(url, sid)
-        else:
-            validators[node] = _accept
+        validators[node] = lambda sid, node=node: _inspect(inspect, sid, node, secrets[node])
     router = Router(secrets, validators)
     ssl_context = None
     if config.get('certificate') and config.get('key'):
         ssl_context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
         ssl_context.load_cert_chain(config['certificate'], config['key'])
+
+    async def health(connection, request):
+        if request.path == '/health':
+            return connection.respond(200, encode({'state': 'ready',
+                'protocol': 'leased-stream-inspect-v1', 'authorities': sorted(secrets),
+                'sessions': len(router.sessions)}))
 
     async def handle(socket):
         try:
@@ -264,6 +266,7 @@ async def serve(config):
         config.get('listen', '0.0.0.0'),
         int(config.get('port', 8751)),
         ssl=ssl_context,
+        process_request=health,
         max_size=4194304,
         max_queue=1,
         write_limit=65536,

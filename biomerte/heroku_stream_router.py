@@ -1,27 +1,33 @@
-"""Heroku entrypoint. Builds config from env and starts the router."""
-
+"""Heroku TLS-terminated leased-stream router; controller IDs remain authorities."""
 import asyncio
+import json
 import os
+import pathlib
 import sys
-
 from biomerte.stream_router import serve
 
+def build_config(environ=None):
+    env = os.environ if environ is None else environ
+    secret = env.get('STREAM_ROUTER_SECRET', '')
+    if len(secret) < 32:
+        raise ValueError('STREAM_ROUTER_SECRET must be at least 32 characters')
+    deployment = json.loads((pathlib.Path(__file__).parent.parent/'controllers.json').read_text())
+    configured = env.get('CONTROLLER_NODE_ID', '')
+    nodes = env.get('CONTROLLER_NODE_IDS', '').split(',') if env.get('CONTROLLER_NODE_IDS') else deployment['authorities']
+    if len(configured)==64 and all(c in '0123456789abcdef' for c in configured):
+        nodes = [configured]
+    if not nodes or any(len(n)!=64 or any(c not in '0123456789abcdef' for c in n) for n in nodes):
+        raise ValueError('Expected controller authority fingerprints')
+    return {'listen':'0.0.0.0', 'port':int(env.get('PORT','8751')),
+        'secrets':{node:secret for node in nodes},
+        'inspect_url':env.get('STREAM_INSPECT_URL') or deployment['inspect_url']}
 
 def main():
-    secret = os.environ.get('STREAM_ROUTER_SECRET', '')
-    node_id = os.environ.get('CONTROLLER_NODE_ID', '')
-    if len(secret) < 32:
-        sys.exit('STREAM_ROUTER_SECRET must be at least 32 characters')
-    if not node_id:
-        sys.exit('CONTROLLER_NODE_ID is required')
-    config = {
-        'listen': '0.0.0.0',
-        'port': int(os.environ.get('PORT', '8751')),
-        'secrets': {node_id: secret},
-        'inspect_url': os.environ.get('STREAM_INSPECT_URL', ''),
-    }
+    try:
+        config=build_config()
+    except ValueError as error:
+        sys.exit(str(error))
     asyncio.run(serve(config))
 
-
-if __name__ == '__main__':
+if __name__=='__main__':
     main()
