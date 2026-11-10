@@ -20,6 +20,8 @@ class ReverseTransportTests(unittest.IsolatedAsyncioTestCase):
    async for message in ws:
     if message.type==WSMsgType.TEXT:await ws.send_str(message.data)
    return ws
+  async def snapshot(request):return web.json_response({'entities':['x'*1000]*10000,'complete':True})
+  local.router.add_post('/api/map/snapshot',snapshot)
   local.router.add_get('/api/state',state);local.router.add_post('/api/controls',stop)
   local.router.add_get('/api/live/{lane}',lane)
   self.local=await self.start(local)
@@ -44,6 +46,13 @@ class ReverseTransportTests(unittest.IsolatedAsyncioTestCase):
   async with self.client.post(self.public+'/api/controls',json={'stop':True}) as r:
    self.assertEqual({'stopped':{'stop':True}},await r.json())
   async with self.client.get(self.public+'/api/state',headers={'Authorization':'Bearer wrong'}) as r:self.assertEqual(401,r.status)
+ async def test_large_snapshot_uses_chunks_and_keeps_control_link_alive(self):
+  async with self.client.post(self.public+'/api/map/snapshot',json={}) as r:
+   self.assertEqual(200,r.status)
+   result=await r.json()
+   self.assertTrue(result['complete']);self.assertEqual(10000,len(result['entities']))
+  async with self.client.get(self.public+'/api/state') as r:self.assertEqual(200,r.status)
+  self.assertIsNotNone(self.ingress.link)
  async def test_independent_live_lanes_and_client_detach_preserve_bridge(self):
   async with self.client.ws_connect(self.public+'/api/live/vision') as vision:
    async with self.client.ws_connect(self.public+'/api/live/control') as control:

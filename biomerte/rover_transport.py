@@ -136,15 +136,34 @@ class Ingress:
         body = await request.read()
         if len(body) > 4096:
             raise web.HTTPRequestEntityTooLarge(max_size=4096, actual_size=len(body))
-        self.pending[identity] = future
+        self.lanes[identity] = future
+        finished = None
+        upstream = None
         try:
             await self.link.send_json({'type':'request', 'id':identity, 'path':path,
                                       'method':request.method, 'body':body.decode()})
-            value = await asyncio.wait_for(future, 15)
-            return web.Response(status=value['status'], text=value['body'],
-                                content_type='application/json')
+            upstream, finished = await asyncio.wait_for(future, 15)
+            metadata = await upstream.receive_json(timeout=15)
+            response = web.StreamResponse(status=metadata['status'], headers={
+                'Content-Type':'application/json', 'Cache-Control':'no-store'})
+            await response.prepare(request)
+            async for message in upstream:
+                if message.type == WSMsgType.BINARY:
+                    await response.write(message.data)
+                elif message.type == WSMsgType.TEXT and message.data == 'end':
+                    await response.write_eof()
+                    return response
+                else:
+                    raise ConnectionError('Incomplete Rover HTTP response')
+            raise ConnectionError('Truncated Rover HTTP response')
         finally:
-            self.pending.pop(identity, None)
+            self.lanes.pop(identity, None)
+            if finished is not None and not finished.done():
+                finished.set_result(None)
+            if upstream is not None:
+                await upstream.close()
+            if self.link is not None and not self.link.closed:
+                await self.link.send_json({'type':'cancel', 'id':identity})
 
     def mount(self, app):
         app.router.add_get('/rover/bridge', self.bridge)
@@ -169,17 +188,23 @@ class Outbound:
                 await splice(local, remote)
 
     async def request(self, session, link, value):
-        try:
-            async with session.request(value['method'], self.local + value['path'],
-                data=value['body'].encode(), headers={**self.site_headers,
-                'Content-Type':'application/json'}, allow_redirects=False) as response:
-                body = await response.text()
-                if len(body) > 4000000:
-                    raise ValueError('Snapshot response too large')
-                reply = {'id':value['id'], 'status':response.status, 'body':body}
-        except Exception:
-            reply = {'id':value['id'], 'status':503, 'body':'{"error":{"code":"ROVER_UNAVAILABLE"}}'}
-        await link.send_json(reply)
+        # Every HTTP response gets its own bounded, backpressured connection.
+        # Snapshots never share the attachment/control link or one giant frame.
+        async with session.ws_connect(self.public + '/rover/data/' + value['id'],
+            headers=self.headers, heartbeat=15, max_msg_size=65536) as remote:
+            try:
+                async with session.request(value['method'], self.local + value['path'],
+                    data=value['body'].encode(), headers={**self.site_headers,
+                    'Content-Type':'application/json'}, allow_redirects=False) as response:
+                    await remote.send_json({'status':response.status})
+                    async for chunk in response.content.iter_chunked(65536):
+                        await remote.send_bytes(chunk)
+                    await remote.send_str('end')
+            except Exception:
+                # A failed partial response closes, rather than masquerading as
+                # complete JSON or replaying the native request.
+                await remote.close(code=1011, message=b'Local HTTP response failed')
+                raise
 
     async def run(self):
         async with ClientSession() as session:
