@@ -262,6 +262,10 @@ class SiteBridge:
 
         app = web.Application(middlewares=[authenticate], client_max_size=32768)
         app.router.add_post('/api/led', self.camera_light.handle)
+        from video_jobs import VideoJobs, video_handler
+        from pathlib import Path
+        app['video_jobs'] = VideoJobs(Path.home() / '.local/share/biome-robot-vision')
+        app.router.add_post('/api/video', video_handler)
         app.router.add_get('/api/state', state)
         app.router.add_post('/api/controls', controls)
         app.router.add_post('/api/map/snapshot', snapshot)

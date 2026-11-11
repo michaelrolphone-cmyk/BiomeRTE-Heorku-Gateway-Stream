@@ -36,6 +36,8 @@ class ReverseTransportTests(unittest.IsolatedAsyncioTestCase):
    return web.json_response({'id':value['session'],'authority':'owner','state':'open'})
   local.router.add_post('/internal/stream/inspect',inspect)
   local.router.add_post('/api/map/snapshot',snapshot)
+  async def video(request):return web.json_response({'received':len(await request.read())})
+  local.router.add_post('/api/video',video)
   local.router.add_get('/api/state',state);local.router.add_post('/api/controls',stop)
   local.router.add_get('/api/live/{lane}',lane)
   self.local=await self.start(local)
@@ -47,6 +49,13 @@ class ReverseTransportTests(unittest.IsolatedAsyncioTestCase):
    await asyncio.sleep(.01)
   self.assertIsNotNone(self.ingress.link)
  async def start(self,app):
+  return await self.start_server(app)
+ async def test_recording_chunks_cross_ingress_without_changing_control_limits(self):
+  async with self.client.post(self.public+'/api/video',data='x'*350000) as r:
+   self.assertEqual(r.status,200);self.assertEqual((await r.json())['received'],350000)
+  async with self.client.post(self.public+'/api/controls',data='x'*5000) as r:
+   self.assertEqual(r.status,413)
+ async def start_server(self,app):
   runner=web.AppRunner(app);await runner.setup();self.addAsyncCleanup(runner.cleanup)
   site=web.TCPSite(runner,'127.0.0.1',0);await site.start()
   return 'http://127.0.0.1:'+str(site._server.sockets[0].getsockname()[1])
