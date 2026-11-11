@@ -25,6 +25,11 @@ class RejectionReasons(unittest.IsolatedAsyncioTestCase):
             async with client.ws_connect('/api/live/control',
                     headers={'Authorization':'Bearer '+'x'*32}) as socket:
                 state = await socket.receive_json()
+                await socket.send_json({'type':'clock', 'id':17})
+                clock = await socket.receive_json()
+                self.assertEqual(clock['type'], 'clock')
+                self.assertEqual(clock['id'],17)
+                self.assertLess(abs(time.time()-clock['server_time']),1)
                 base = dict(type='intent', sequence=1, epoch=state['epoch'],
                             stop_generation=state['stop_generation'],
                             issued_at=time.time(),
