@@ -14,7 +14,7 @@ class ReverseTransportTests(unittest.IsolatedAsyncioTestCase):
  async def asyncSetUp(self):
   self.secret='test-secret-'*8
   self.ingress=Ingress(self.secret)
-  ingress_app=web.Application();self.ingress.mount(ingress_app)
+  ingress_app=web.Application(client_max_size=4096);self.ingress.mount(ingress_app)
   self.public=await self.start(ingress_app)
   local=web.Application()
   async def state(request):

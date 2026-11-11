@@ -129,8 +129,10 @@ class Ingress:
             return await self.live(request, {'type':'open','path':path}, 4096)
         if request.method not in ('GET', 'POST'):
             raise web.HTTPMethodNotAllowed(request.method, ('GET', 'POST'))
-        body = await request.read()
         maximum = 524288 if path == '/api/video' else 4096
+        # The production application's default is 4 KiB. Override it only for
+        # this authenticated upload route before aiohttp reads the body.
+        body = await request.clone(client_max_size=maximum).read()
         if len(body) > maximum:
             raise web.HTTPRequestEntityTooLarge(max_size=maximum, actual_size=len(body))
         self.lanes[identity] = future
