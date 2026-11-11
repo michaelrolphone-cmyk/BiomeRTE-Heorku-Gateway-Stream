@@ -16,6 +16,7 @@ from aiohttp import web
 from biomerte.app import Application, read_json
 from biomerte.identity import sign
 from biomerte.rover import Rover
+from biomerte.control_clock import ControlClock
 from rover_transport import Outbound, derived, local_router
 from site_bridge import SiteBridge
 
@@ -122,8 +123,9 @@ async def run():
     app=Application(str(pathlib.Path.home()/'.local/share/biomerte-controller'))
     secret=app.config['stream_router_secret']
     remote=RoutedRemote(app,home)
+    clock=await ControlClock().start()
     rover=FreshRover(remote,{'robot.vision.stream:1':'robotvision.mac.ae3c74c06d1909a1ccdc',
-                           'device.outputs.stream:1':'relay6ch.30eda0d95f24'},task='rover-site-server')
+                           'device.outputs.stream:1':'relay6ch.30eda0d95f24'},task='rover-site-server',clock=clock)
     rover.local_router=local_router(os.environ.get('BIOMERTE_LOCAL_STREAM_ROUTER'))
     if rover.local_router:
         if not hasattr(rover,'require_provider_ready'):
@@ -169,6 +171,7 @@ async def run():
             waiter.cancel()
             with contextlib.suppress(asyncio.CancelledError):await waiter
         await runner.cleanup()
+        await clock.close()
 
 if __name__=='__main__':
     try:asyncio.run(run())

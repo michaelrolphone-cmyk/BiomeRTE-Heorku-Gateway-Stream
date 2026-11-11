@@ -114,7 +114,7 @@ class Ingress:
     async def public(self, request):
         self.authenticate(request, self.site_token, 'Bearer ')
         path = request.path
-        if path not in ('/api/state', '/api/controls', '/api/map/snapshot',
+        if path not in ('/api/state', '/api/controls', '/api/map/snapshot', '/api/video',
                         '/api/live/vision', '/api/live/map', '/api/live/control'):
             raise web.HTTPNotFound()
         if self.link is None or self.link.closed:
@@ -130,8 +130,9 @@ class Ingress:
         if request.method not in ('GET', 'POST'):
             raise web.HTTPMethodNotAllowed(request.method, ('GET', 'POST'))
         body = await request.read()
-        if len(body) > 4096:
-            raise web.HTTPRequestEntityTooLarge(max_size=4096, actual_size=len(body))
+        maximum = 524288 if path == '/api/video' else 4096
+        if len(body) > maximum:
+            raise web.HTTPRequestEntityTooLarge(max_size=maximum, actual_size=len(body))
         self.lanes[identity] = future
         finished = None
         upstream = None
@@ -296,7 +297,7 @@ class Outbound:
             while True:
                 try:
                     async with session.ws_connect(self.public + '/rover/bridge',
-                        headers=self.headers, heartbeat=15, max_msg_size=65536) as link:
+                        headers=self.headers, heartbeat=15, max_msg_size=1048576) as link:
                         async for message in link:
                             if message.type != WSMsgType.TEXT:
                                 continue
