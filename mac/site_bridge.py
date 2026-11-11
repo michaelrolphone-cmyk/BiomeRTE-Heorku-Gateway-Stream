@@ -7,6 +7,7 @@ import asyncio
 import contextlib
 import hmac
 import json
+import math
 import time
 import uuid
 from aiohttp import web
@@ -147,15 +148,27 @@ class SiteBridge:
                     async for message in socket:
                         if lane != 'control':continue
                         if message.type != web.WSMsgType.TEXT:continue
+                        value = None
                         try:
-                            previous, receipt = self.accept(json.loads(message.data), previous)
+                            value = json.loads(message.data)
+                            if isinstance(value, dict) and value.get('type') == 'clock':
+                                if type(value.get('id')) is not int or not 0 <= value['id'] <= 9007199254740991:
+                                    raise ValueError('Invalid control clock request')
+                                await socket.send_json({'type':'clock', 'id':value['id'], 'server_time':time.time()})
+                                continue
+                            previous, receipt = self.accept(value, previous)
                             await socket.send_json(receipt)
                         except (ValueError, KeyError, TypeError, RuntimeError) as error:
                             reasons = {'Old or duplicate browser sequence', 'Unknown browser stream message',
                                        'Superseded browser control epoch', 'Expired browser intent',
-                                       'Expected four Boolean directions', 'Control stream unavailable'}
+                                       'Expected four Boolean directions', 'Control stream unavailable',
+                                       'Invalid control clock request'}
                             reason = str(error) if str(error) in reasons else 'Invalid control input'
-                            await socket.send_json({'type': 'rejected', 'message': reason + '; release and press again.'})
+                            detail = ''
+                            issued = value.get('issued_at') if isinstance(value, dict) else None
+                            if reason == 'Expired browser intent' and type(issued) in (int, float) and math.isfinite(issued):
+                                detail = ' (age ' + str(round((time.time()-issued)*1000)) + ' ms)'
+                            await socket.send_json({'type': 'rejected', 'message': reason + detail + '; release and press again.'})
                 tasks = [asyncio.create_task(send(queues[lane])), asyncio.create_task(receive())]
                 if lane == 'control':tasks.append(asyncio.create_task(send(status_queue)))
                 try:
