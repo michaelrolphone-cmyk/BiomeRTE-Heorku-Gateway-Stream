@@ -150,8 +150,12 @@ class SiteBridge:
                         try:
                             previous, receipt = self.accept(json.loads(message.data), previous)
                             await socket.send_json(receipt)
-                        except (ValueError, KeyError, TypeError, RuntimeError):
-                            await socket.send_json({'type': 'rejected', 'message': 'Control unavailable, stale or invalid; release and press again.'})
+                        except (ValueError, KeyError, TypeError, RuntimeError) as error:
+                            reasons = {'Old or duplicate browser sequence', 'Unknown browser stream message',
+                                       'Superseded browser control epoch', 'Expired browser intent',
+                                       'Expected four Boolean directions', 'Control stream unavailable'}
+                            reason = str(error) if str(error) in reasons else 'Invalid control input'
+                            await socket.send_json({'type': 'rejected', 'message': reason + '; release and press again.'})
                 tasks = [asyncio.create_task(send(queues[lane])), asyncio.create_task(receive())]
                 if lane == 'control':tasks.append(asyncio.create_task(send(status_queue)))
                 try:
