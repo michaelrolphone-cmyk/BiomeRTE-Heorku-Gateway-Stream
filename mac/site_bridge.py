@@ -85,6 +85,7 @@ class SiteBridge:
                     ready=bool(self.rover.control_ready), channels=self.channels,
                     server_time=time.time(), lease_owner='server', intent_ttl_ms=self.intent_ttl_ms,
                     control_transport=dict(self.control_metrics),
+                    control_clock=self.rover.clock.status() if getattr(self.rover,'clock',None) else None,
                     native={k:self.rover.descriptors.get('device.outputs.stream:1', {}).get(k)
                             for k in ('authority', 'generation', 'epoch')})
 
