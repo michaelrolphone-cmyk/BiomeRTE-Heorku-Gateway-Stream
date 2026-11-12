@@ -73,7 +73,7 @@ class Ingress:
         self.authenticate(request, self.key, 'Bridge ')
         if self.link is not None:
             raise web.HTTPConflict(text='Rover bridge already connected')
-        socket = web.WebSocketResponse(heartbeat=15, max_msg_size=4194304)
+        socket = web.WebSocketResponse(heartbeat=15, max_msg_size=0)
         await socket.prepare(request)
         self.link = socket
         self.capabilities = set(request.headers.get('X-Bridge-Capabilities', '').split(','))
@@ -129,12 +129,8 @@ class Ingress:
             return await self.live(request, {'type':'open','path':path}, 4096)
         if request.method not in ('GET', 'POST'):
             raise web.HTTPMethodNotAllowed(request.method, ('GET', 'POST'))
-        maximum = 524288 if path == '/api/video' else 4096
-        # The production application's default is 4 KiB. Override it only for
-        # this authenticated upload route before aiohttp reads the body.
-        body = await request.clone(client_max_size=maximum).read()
-        if len(body) > maximum:
-            raise web.HTTPRequestEntityTooLarge(max_size=maximum, actual_size=len(body))
+        # Authenticated requests are not subject to an application byte quota.
+        body = await request.clone(client_max_size=0).read()
         self.lanes[identity] = future
         finished = None
         upstream = None
@@ -299,7 +295,7 @@ class Outbound:
             while True:
                 try:
                     async with session.ws_connect(self.public + '/rover/bridge',
-                        headers=self.headers, heartbeat=15, max_msg_size=1048576) as link:
+                        headers=self.headers, heartbeat=15, max_msg_size=0) as link:
                         async for message in link:
                             if message.type != WSMsgType.TEXT:
                                 continue
@@ -332,3 +328,4 @@ class Outbound:
                     await asyncio.gather(*tasks, return_exceptions=True)
                     self.tasks.clear()
                 await asyncio.sleep(1)
+

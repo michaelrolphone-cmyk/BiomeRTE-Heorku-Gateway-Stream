@@ -43,7 +43,7 @@ def application(config):
     owner=config.get('router_owner','hosted')
     if owner not in ('hosted','mac_bridge'):
         raise ValueError('Unknown native session owner')
-    app = web.Application(client_max_size=4096)
+    app = web.Application(client_max_size=0)
     async def health(request):
         return web.json_response({'state':'ready','protocol':'leased-stream-inspect-v1',
             'authorities':sorted(secrets),
