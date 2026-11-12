@@ -11,6 +11,12 @@ class CameraLight:
     def __init__(self, url=None):
         self.url = url or os.environ.get('ROVER_CAMERA_LIGHT_URL', 'http://192.168.1.45/api/light')
         self.lock = asyncio.Lock()
+        self.session = None
+
+    async def close(self):
+        if self.session is not None:
+            await self.session.close()
+            self.session = None
 
     async def request(self, body):
         if not isinstance(body, dict) or set(body) - {'led'}:
@@ -24,12 +30,14 @@ class CameraLight:
             update = dict(on=update['on'], brightness=round(update['brightness'] * 255 / 100),
                           rgb=COLORS[update['color']])
         async with self.lock:
-            async with ClientSession(timeout=ClientTimeout(total=4)) as session:
-                options = {'json': update} if update is not None else {}
-                async with session.request('POST' if update is not None else 'GET', self.url, **options) as response:
-                    data = await response.json()
-                    if response.status != 200:
-                        raise RuntimeError('Camera light command rejected (HTTP %s)' % response.status)
+            if self.session is None or self.session.closed:
+                self.session = ClientSession(timeout=ClientTimeout(total=4))
+            session = self.session
+            options = {'json': update} if update is not None else {}
+            async with session.request('POST' if update is not None else 'GET', self.url, **options) as response:
+                data = await response.json()
+                if response.status != 200:
+                    raise RuntimeError('Camera light command rejected (HTTP %s)' % response.status)
         if not data.get('ready') or not data.get('command_state_known'):
             raise RuntimeError('Camera LED output is unconfirmed')
         color = next((name for name, rgb in COLORS.items() if rgb == data.get('rgb')), 'white')

@@ -1,0 +1,9 @@
+# Camera LED commands over the rover control socket
+
+The authenticated `/api/live/control` WebSocket accepts LED requests as well as drive and clock messages. Site clients use `/api/biome/live/control`, with the existing Site authentication. Other authenticated consumers may use the same socket protocol; browser disconnection does not acquire or release native drive leases.
+
+Send `{"type":"led","id":"unique-request-id","led":{"on":false,"brightness":1,"color":"white"}}`. Brightness is an integer percentage 0..100; colors are red, green, blue or white. Omit `led` to read current state. Every result has `type:led` and the same `id`, plus either current `led` state and `applied`, or an error. `applied:true` means the camera driver acknowledged this command, not independent optical verification.
+
+The LED task runs independently of drive/clock handling. One in-flight LED request is allowed per socket. `LED_BUSY` rejects a new request without sending it to the camera; clients should coalesce slider changes and send the latest state after the prior result. Invalid requests report `INVALID_LED`; uncertain network or camera failures report `LED_UNAVAILABLE`. Read state after reconnect or uncertainty; never replay an old power-on request automatically. This socket extension retains the legacy HTTP handler for existing clients; updated GUI code must use the socket.
+
+The bridge reuses its independent camera HTTP connection and closes it on shutdown. This change does not reflash the camera, alter GPIO40 sonar wiring, or publish an unimplemented native capability stream.
