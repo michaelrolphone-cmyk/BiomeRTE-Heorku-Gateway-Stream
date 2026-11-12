@@ -30,11 +30,23 @@ def local_router(value):
 
 
 async def copy_socket(source, target):
-    async for message in source:
+    while True:
+        message = await source.receive()
         if message.type == WSMsgType.BINARY:
             await target.send_bytes(message.data)
         elif message.type == WSMsgType.TEXT:
             await target.send_str(message.data)
+        elif message.type == WSMsgType.CLOSE:
+            code = message.data or 1000
+            #1005/1006/1015 are local observations and cannot be sent on wire.
+            if code in (1005, 1006, 1015):
+                code = 1011
+            await target.close(code=code, message=(message.extra or '').encode())
+            return
+        elif message.type == WSMsgType.CLOSED:
+            code = source.close_code or 1000
+            await target.close(code=1011 if code in (1005,1006,1015) else code)
+            return
         elif message.type == WSMsgType.ERROR:
             raise source.exception() or ConnectionError('Socket failed')
 
@@ -328,4 +340,5 @@ class Outbound:
                     await asyncio.gather(*tasks, return_exceptions=True)
                     self.tasks.clear()
                 await asyncio.sleep(1)
+
 
