@@ -16,7 +16,7 @@ class ReverseTransportTests(unittest.IsolatedAsyncioTestCase):
   self.ingress=Ingress(self.secret)
   ingress_app=web.Application(client_max_size=4096);self.ingress.mount(ingress_app)
   self.public=await self.start(ingress_app)
-  local=web.Application()
+  local=web.Application(client_max_size=0)
   async def state(request):
    self.assertEqual('Bearer '+derived(self.secret,'rover-site'),request.headers['Authorization'])
    return web.json_response({'ready':True,'owner':'server'})
@@ -27,7 +27,7 @@ class ReverseTransportTests(unittest.IsolatedAsyncioTestCase):
    async for message in ws:
     if message.type==WSMsgType.TEXT:await ws.send_str(message.data)
    return ws
-  async def snapshot(request):return web.json_response({'entities':['x'*1000]*10000,'complete':True})
+  async def snapshot(request):return web.json_response({'entities':['x'*1000]*10000,'complete':True,'request_bytes':len(await request.read())})
   self.revoked=False
   async def inspect(request):
    self.assertEqual(derived(self.secret,'router-inspect'),request.headers['X-Router-Inspect'])
@@ -50,11 +50,17 @@ class ReverseTransportTests(unittest.IsolatedAsyncioTestCase):
   self.assertIsNotNone(self.ingress.link)
  async def start(self,app):
   return await self.start_server(app)
- async def test_recording_chunks_cross_ingress_without_changing_control_limits(self):
+ async def test_recording_chunks_and_control_remain_independent(self):
   async with self.client.post(self.public+'/api/video',data='x'*350000) as r:
    self.assertEqual(r.status,200);self.assertEqual((await r.json())['received'],350000)
-  async with self.client.post(self.public+'/api/controls',data='x'*5000) as r:
-   self.assertEqual(r.status,413)
+  async with self.client.post(self.public+'/api/controls',json={'stop':True}) as r:
+   self.assertEqual(r.status,200);self.assertEqual((await r.json())['stopped'],{'stop':True})
+ async def test_signed_map_requests_have_no_application_byte_quota(self):
+  payload={'world':True,'cursor':'signed-reference-'*80000}
+  async with self.client.post(self.public+'/api/map/snapshot',json=payload) as r:
+   self.assertEqual(r.status,200)
+   self.assertGreater((await r.json())['request_bytes'],1048576)
+  async with self.client.get(self.public+'/api/state') as r:self.assertEqual(r.status,200)
  async def start_server(self,app):
   runner=web.AppRunner(app);await runner.setup();self.addAsyncCleanup(runner.cleanup)
   site=web.TCPSite(runner,'127.0.0.1',0);await site.start()

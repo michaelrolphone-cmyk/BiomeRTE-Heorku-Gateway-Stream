@@ -260,7 +260,7 @@ class SiteBridge:
                     await asyncio.gather(*tasks, return_exceptions=True)
             return socket
 
-        app = web.Application(middlewares=[authenticate], client_max_size=32768)
+        app = web.Application(middlewares=[authenticate], client_max_size=0)
         app.router.add_post('/api/led', self.camera_light.handle)
         from video_jobs import VideoJobs, video_handler
         from pathlib import Path
