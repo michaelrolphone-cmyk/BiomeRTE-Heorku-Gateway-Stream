@@ -115,6 +115,7 @@ class Ingress:
         self.authenticate(request, self.site_token, 'Bearer ')
         path = request.path
         if path not in ('/api/state', '/api/controls', '/api/map/snapshot', '/api/video',
+                        '/api/motion/model', '/api/motion/predict',
                         '/api/live/vision', '/api/live/map', '/api/live/control'):
             raise web.HTTPNotFound()
         if self.link is None or self.link.closed:
