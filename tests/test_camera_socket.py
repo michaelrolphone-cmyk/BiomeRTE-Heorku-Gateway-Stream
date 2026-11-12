@@ -48,3 +48,20 @@ class CameraSocketTests(unittest.IsolatedAsyncioTestCase):
             async with client.ws_connect('/api/live/control',headers={'Authorization':'Bearer '+'x'*32}) as ws:
                 await ws.receive_json();await ws.send_json(dict(type='led',id='bad',led={'invalid':True}));reply=await ws.receive_json();self.assertEqual('bad',reply['id']);self.assertEqual('INVALID_LED',reply['error']['code'])
                 await ws.send_json(dict(type='led',id='read'));reply=await ws.receive_json();self.assertEqual('read',reply['id']);self.assertFalse(reply['applied'])
+
+    async def test_camera_connection_closes_after_each_reply(self):
+        from aiohttp import web
+        transports=[]
+        async def handler(request):
+            transports.append(request.transport)
+            return web.json_response(dict(ready=True,command_state_known=True,on=False,brightness=3,rgb=[255,255,255]))
+        app=web.Application();app.router.add_get('/api/light',handler)
+        async with TestServer(app) as server:
+            camera=CameraLight(str(server.make_url('/api/light')))
+            try:
+                await camera.request({})
+                await asyncio.sleep(.05)
+                self.assertTrue(transports[0].is_closing())
+                await camera.request({})
+                self.assertIsNot(transports[0],transports[1])
+            finally:await camera.close()

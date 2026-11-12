@@ -1,7 +1,7 @@
 """Independent camera LED transport; never holds or changes drive output leases."""
 import asyncio
 import os
-from aiohttp import ClientSession, ClientTimeout, web
+from aiohttp import ClientSession, ClientTimeout, TCPConnector, web
 
 COLORS = {'red': [255, 0, 0], 'green': [0, 255, 0],
           'blue': [0, 0, 255], 'white': [255, 255, 255]}
@@ -31,7 +31,7 @@ class CameraLight:
                           rgb=COLORS[update['color']])
         async with self.lock:
             if self.session is None or self.session.closed:
-                self.session = ClientSession(timeout=ClientTimeout(total=4))
+                self.session = ClientSession(timeout=ClientTimeout(total=4), connector=TCPConnector(force_close=True))
             session = self.session
             options = {'json': update} if update is not None else {}
             async with session.request('POST' if update is not None else 'GET', self.url, **options) as response:
