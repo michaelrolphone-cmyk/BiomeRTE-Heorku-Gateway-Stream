@@ -38,6 +38,10 @@ class ReverseTransportTests(unittest.IsolatedAsyncioTestCase):
   local.router.add_post('/api/map/snapshot',snapshot)
   async def video(request):return web.json_response({'received':len(await request.read())})
   local.router.add_post('/api/video',video)
+  async def motion_model(request):return web.json_response({'revision':7})
+  async def motion_predict(request):return web.json_response({'executes_motion':False,'request':await request.json()})
+  local.router.add_get('/api/motion/model',motion_model)
+  local.router.add_post('/api/motion/predict',motion_predict)
   local.router.add_get('/api/state',state);local.router.add_post('/api/controls',stop)
   local.router.add_get('/api/live/{lane}',lane)
   self.local=await self.start(local)
@@ -50,6 +54,13 @@ class ReverseTransportTests(unittest.IsolatedAsyncioTestCase):
   self.assertIsNotNone(self.ingress.link)
  async def start(self,app):
   return await self.start_server(app)
+ async def test_authenticated_read_only_motion_routes(self):
+  async with self.client.get(self.public+'/api/motion/model') as r:
+   self.assertEqual(r.status,200);self.assertEqual((await r.json())['revision'],7)
+  payload={'pulses':[{'mask':5,'duration_s':.8},{'mask':1,'duration_s':.7}]}
+  async with self.client.post(self.public+'/api/motion/predict',json=payload) as r:
+   self.assertEqual(r.status,200);value=await r.json();self.assertFalse(value['executes_motion']);self.assertEqual(value['request'],payload)
+  async with self.client.get(self.public+'/api/motion/model',headers={'Authorization':'Bearer wrong'}) as r:self.assertEqual(r.status,401)
  async def test_recording_chunks_and_control_remain_independent(self):
   async with self.client.post(self.public+'/api/video',data='x'*350000) as r:
    self.assertEqual(r.status,200);self.assertEqual((await r.json())['received'],350000)
