@@ -24,7 +24,7 @@ class ControlOutbox:
     Rejections and state changes have their own slots, so an ACK burst cannot
     evict a release/repress instruction or a fresh binding.
     """
-    priority = ('state', 'rejected', 'clock', 'accepted', 'ack')
+    priority = ('state', 'rejected', 'clock', 'led', 'accepted', 'ack')
 
     def __init__(self, socket, metrics):
         self.socket, self.metrics = socket, metrics
@@ -194,6 +194,7 @@ class SiteBridge:
                 self.clients.add(status_queue)
                 self.synchronize()
                 if status_queue.empty():status_queue.put_nowait(self.state())
+            led_task = None
             outbox = ControlOutbox(socket, self.control_metrics) if lane == 'control' else None
             async with self.rover.subscribe() as queues:
                 async def send(queue):
@@ -205,7 +206,18 @@ class SiteBridge:
                 async def collect(queue, kind):
                     while True:
                         outbox.offer(kind, await queue.get())
+                async def camera_reply(value):
+                    identity = value['id']
+                    try:
+                        body = {'led': value['led']} if 'led' in value else {}
+                        state = await self.camera_light.request(body)
+                        outbox.offer('led', dict(type='led', id=identity, applied='led' in value, **state))
+                    except ValueError as error:
+                        outbox.offer('led', dict(type='led', id=identity, error={'code':'INVALID_LED','message':str(error)}))
+                    except Exception:
+                        outbox.offer('led', dict(type='led', id=identity, error={'code':'LED_UNAVAILABLE','message':'Read LED state before retrying an uncertain update.'}))
                 async def receive():
+                    nonlocal led_task
                     previous = -1
                     last_input = None
                     previously_held = False
@@ -219,6 +231,15 @@ class SiteBridge:
                                 if type(value.get('id')) is not int or not 0 <= value['id'] <= 9007199254740991:
                                     raise ValueError('Invalid control clock request')
                                 outbox.offer('clock', {'type':'clock', 'id':value['id'], 'server_time':time.time()})
+                                continue
+                            if isinstance(value, dict) and value.get('type') == 'led':
+                                identity = value.get('id')
+                                if not isinstance(identity, str) or not 1 <= len(identity) <= 96 or set(value) - {'type','id','led'}:
+                                    raise ValueError('Invalid LED socket request')
+                                if led_task is not None and not led_task.done():
+                                    outbox.offer('led', dict(type='led', id=identity, error={'code':'LED_BUSY','message':'Wait for the current LED result; coalesce slider changes.'}))
+                                else:
+                                    led_task = asyncio.create_task(camera_reply(value))
                                 continue
                             received = time.monotonic()
                             previous, receipt = self.accept(value, previous)
@@ -237,7 +258,7 @@ class SiteBridge:
                             reasons = {'Old or duplicate browser sequence', 'Unknown browser stream message',
                                        'Superseded browser control epoch', 'Expired browser intent',
                                        'Expected four Boolean directions', 'Control stream unavailable',
-                                       'Invalid control clock request'}
+                                       'Invalid control clock request', 'Invalid LED socket request'}
                             reason = str(error) if str(error) in reasons else 'Invalid control input'
                             detail = ''
                             issued = value.get('issued_at') if isinstance(value, dict) else None
@@ -255,6 +276,8 @@ class SiteBridge:
                     done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
                     for task in done:task.result()
                 finally:
+                    if led_task is not None:
+                        await asyncio.gather(led_task, return_exceptions=True)
                     self.clients.discard(status_queue)
                     for task in tasks:task.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
@@ -277,6 +300,7 @@ class SiteBridge:
             if self.monitor:
                 self.monitor.cancel()
                 with contextlib.suppress(asyncio.CancelledError):await self.monitor
+            await self.camera_light.close()
             await self.rover.close()
         app.on_startup.append(start)
         app.on_cleanup.append(close)
