@@ -99,7 +99,7 @@ class FreshRover(Rover):
     def broadcast(self, lane, message):
         if lane == 'vision':
             from biomerte.stream_router import decode
-            metadata, unused = decode(message, 4194304)
+            metadata, unused = decode(message)
             processed = metadata.get('processed_monotonic')
             # Provider and server share this Mac's monotonic clock. This bound
             # is explicitly processing-to-server, not camera capture latency.

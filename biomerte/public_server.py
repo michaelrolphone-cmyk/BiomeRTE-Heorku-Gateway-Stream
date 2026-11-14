@@ -50,6 +50,7 @@ def application(config):
             'authority_inspection_links':sorted(authorities.links),'sessions':len(router.sessions),
             'rover_bridge':ingress.link is not None,
             'session_owner':owner,
+            'telemetry_header_limit_bytes':None,'telemetry_packet_limit_bytes':None,
             'native_owner_connected':'native_router' in ingress.capabilities,
             'owner_inspection_configured':bool(config.get('rover_authority')),
             'owner_inspection_connected':bool(config.get('rover_authority') and ingress.link is not None),
@@ -57,7 +58,7 @@ def application(config):
     async def stream(request):
         if owner=='mac_bridge':
             return await ingress.native(request)
-        socket = web.WebSocketResponse(heartbeat=15, max_msg_size=4194304,
+        socket = web.WebSocketResponse(heartbeat=15, max_msg_size=0,
                                        writer_limit=65536)
         await socket.prepare(request)
         try:

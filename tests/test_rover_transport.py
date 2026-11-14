@@ -23,7 +23,7 @@ class ReverseTransportTests(unittest.IsolatedAsyncioTestCase):
   async def stop(request):return web.json_response({'stopped':await request.json()})
   async def lane(request):
    ws=web.WebSocketResponse();await ws.prepare(request)
-   await ws.send_bytes(b'fresh-frame')
+   await ws.send_bytes(getattr(self,'telemetry_packet',b'fresh-frame'))
    async for message in ws:
     if message.type==WSMsgType.TEXT:await ws.send_str(message.data)
    return ws
@@ -101,6 +101,16 @@ class ReverseTransportTests(unittest.IsolatedAsyncioTestCase):
    if not self.ingress.lanes and not self.outbound.tasks:break
    await asyncio.sleep(.01)
   self.assertEqual({},self.ingress.lanes);self.assertEqual({},self.outbound.tasks)
+ async def test_complete_five_megabyte_header_survives_public_reverse_transport(self):
+  from biomerte.stream_router import frame,decode
+  metadata={'frame_id':'test:large','ahrs':{'sample_clock_us':123},'tof':{'forward':[1,2],'reverse':[2,1]},'diagnostics':'x'*5000000}
+  self.telemetry_packet=frame(metadata,b'jpeg')
+  async with self.client.ws_connect(self.public+'/api/live/vision',max_msg_size=0) as vision:
+   value=await vision.receive(timeout=5)
+   self.assertEqual(value.type,WSMsgType.BINARY)
+   actual,payload=decode(value.data)
+   self.assertEqual(actual,metadata);self.assertEqual(payload,b'jpeg')
+  async with self.client.get(self.public+'/api/state') as response:self.assertEqual(response.status,200)
  async def test_bridge_loss_closes_live_lane_without_replaying_requests(self):
   async with self.client.ws_connect(self.public+'/api/live/control') as control:
    await control.receive(timeout=2)

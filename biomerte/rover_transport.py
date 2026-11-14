@@ -112,7 +112,7 @@ class Ingress:
         future = self.lanes.get(request.match_info['id'])
         if future is None or future.done():
             raise web.HTTPNotFound()
-        socket = web.WebSocketResponse(heartbeat=15, max_msg_size=4194304,
+        socket = web.WebSocketResponse(heartbeat=15, max_msg_size=0,
                                        writer_limit=65536)
         await socket.prepare(request)
         finished = asyncio.get_running_loop().create_future()
@@ -179,7 +179,7 @@ class Ingress:
         if 'native_router' not in self.capabilities:
             raise web.HTTPServiceUnavailable(text='Native session owner disconnected')
         return await self.live(request, {'type':'native_open','path':request.path,
-                                        'authorization':authorization}, 4194304)
+                                        'authorization':authorization}, 0)
 
     async def live(self, request, notice, maximum):
         if request.headers.get('Upgrade', '').lower() != 'websocket':
@@ -254,17 +254,17 @@ class Outbound:
             raise ValueError('Invalid native stream path')
         async with session.ws_connect(self.native_router + value['path'],
             headers={'Authorization':value['authorization']}, heartbeat=15,
-            max_msg_size=4194304) as local:
+            max_msg_size=0) as local:
             async with session.ws_connect(self.public + '/rover/data/' + value['id'],
-                headers=self.headers, heartbeat=15, max_msg_size=4194304) as remote:
+                headers=self.headers, heartbeat=15, max_msg_size=0) as remote:
                 await splice(local, remote)
 
     async def open(self, session, identity, path):
         async with session.ws_connect(self.local + path, headers=self.site_headers,
-                                      heartbeat=15, max_msg_size=4194304) as local:
+                                      heartbeat=15, max_msg_size=0) as local:
             async with session.ws_connect(self.public + '/rover/data/' + identity,
                                           headers=self.headers, heartbeat=15,
-                                          max_msg_size=4194304) as remote:
+                                          max_msg_size=0) as remote:
                 await splice(local, remote)
 
     async def request(self, session, link, value):
