@@ -28,7 +28,7 @@ async with websocket_server(
     config.get('listen', '0.0.0.0'),
     int(config.get('port', 8751)),
     ssl=ssl_context,
-    max_size=4194304,
+    max_size=None,
     max_queue=1,
     write_limit=65536,
 ):
@@ -91,3 +91,6 @@ Directions and neutral use the same policy. This accommodates measured public
 transport delay and clock uncertainty; the router and provider still reject
 expired input and enforce the one-second maximum. Keep host clocks synchronized
 with NTP. A server acceptance is separate from provider received/applied feedback.
+
+## Telemetry sizes
+Telemetry headers and packets have no artificial byte cap. Complete JSON metadata is preserved; framing lengths, identities and epochs remain validated. Superseded camera frames remain latest-only.
