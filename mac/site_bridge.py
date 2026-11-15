@@ -161,6 +161,9 @@ class SiteBridge:
 
         async def controls(request):
             body = await request.json()
+            if isinstance(body, dict) and body.get('type') == 'survey_zero':
+                from survey_zero import zero_survey
+                return await zero_survey(body)
             if isinstance(body, dict) and set(body) == {'led'}:
                 return await self.camera_light.handle(request)
             if body != {'stop': True}:

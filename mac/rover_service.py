@@ -13,7 +13,7 @@ import time
 import urllib.request
 import uuid
 from aiohttp import web
-from biomerte.app import Application, read_json
+from biomerte.app import read_json
 from biomerte.identity import sign
 from biomerte.rover import Rover
 from biomerte.control_clock import ControlClock
@@ -25,6 +25,29 @@ PI='687eda586198b9e7c2bdad0c6f69731b63552e6a650e6514c663f3d472c8f714'
 SITE='f45540bf9910412680734d0613e84460'
 GATEWAY='https://biomerte-controller.cantikash.chatgpt.site'
 PUBLIC='https://biomerte-stream-gateway-e0322b2b60c9.herokuapp.com'
+
+
+class LocalAuthority:
+    """Use the running controller API; never run a bundled authority on its database."""
+    def __init__(self, directory, caller_home):
+        self.config = read_json(str(pathlib.Path(directory)/'node.json'))
+        self.node = self.config['node']
+        self.caller_home = pathlib.Path(caller_home)
+        self.identity = read_json(str(self.caller_home/'node.json'))
+
+    def call(self, operation, arguments, request_id, auth=None, realm='site', controller=None):
+        envelope = dict(site=self.config['site'], realm=realm, operation=operation,
+                        arguments=arguments, id=request_id, controller=controller or self.node)
+        envelope['auth'] = auth or dict(actor=self.identity['node'],
+            signature=sign(str(self.caller_home/'node.key'), envelope))
+        request = urllib.request.Request('http://127.0.0.1:8740/v1/call',
+            data=json.dumps(envelope).encode(), headers={'Content-Type':'application/json',
+            'User-Agent':'BiomeRTE-Rover-Server/1'})
+        with urllib.request.urlopen(request, timeout=20) as response:
+            value = json.load(response)
+        if 'error' in value:
+            raise ConnectionError('Controller rejected Rover request: '+str(value['error']))
+        return value['result']
 
 
 class RoutedRemote:
@@ -130,7 +153,7 @@ async def run():
     from logging.handlers import RotatingFileHandler
     logging.basicConfig(level=logging.WARNING,handlers=[RotatingFileHandler(
         home/'runtime.log',maxBytes=1048576,backupCount=1)])
-    app=Application(str(pathlib.Path.home()/'.local/share/biomerte-controller'))
+    app=LocalAuthority(pathlib.Path.home()/'.local/share/biomerte-controller',home)
     secret=app.config['stream_router_secret']
     remote=RoutedRemote(app,home)
     clock=await ControlClock().start()
