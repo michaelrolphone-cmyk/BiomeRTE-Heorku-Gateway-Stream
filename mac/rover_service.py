@@ -33,10 +33,13 @@ class RoutedRemote:
         self.identity = read_json(str(home/'node.json'))
         self.leases = {}
         self.sessions = {}
+        self.operations = {}
 
     def call(self, operation, arguments):
-        if operation == 'cap.acquire':
+        if operation in ('cap.acquire','cap.submit'):
             controller = PI if arguments['resource'].startswith('relay6ch.') else MAC
+        elif operation == 'cap.status':
+            controller = self.operations[arguments['operation']]
         elif 'lease' in arguments:
             controller = self.leases[arguments['lease']]
         elif 'session' in arguments:
@@ -61,6 +64,10 @@ class RoutedRemote:
             if 'error' in value:
                 raise ConnectionError('Controller rejected Rover request')
             result = value['result']
+        if operation == 'cap.submit':
+            self.operations[arguments['operation']] = controller
+        if operation == 'cap.status' and result.get('state') in ('succeeded','failed','abandoned','denied','cancelled','uncertain'):
+            self.operations.pop(arguments['operation'], None)
         if operation == 'cap.acquire':
             self.leases[result['id']] = controller
         if operation in ('stream.open','stream.attach'):
@@ -100,6 +107,8 @@ class FreshRover(Rover):
         if lane == 'vision':
             from biomerte.stream_router import decode
             metadata, unused = decode(message)
+            if metadata.get('type') in ('sensor_manifest', 'world_snapshot'):
+                return super().broadcast(lane, message)
             processed = metadata.get('processed_monotonic')
             # Provider and server share this Mac's monotonic clock. This bound
             # is explicitly processing-to-server, not camera capture latency.
@@ -108,11 +117,12 @@ class FreshRover(Rover):
         super().broadcast(lane, message)
 
 
-def map_snapshot():
-    from biome_provider import VisionClient
-    from map_snapshot import reader
-    client = VisionClient(pathlib.Path.home()/'.local/share/biome-robot-vision/vision.sock', timeout=10)
-    return reader(client)
+def map_snapshot(rover):
+    async def read(map_id, revision):
+        if not isinstance(map_id, str) or type(revision) is not int or revision < 0:
+            raise web.HTTPBadRequest(text='Expected map ID and revision')
+        return await rover.read_capability('robot.map.snapshot:1', {'map_id':map_id, 'revision':revision})
+    return read
 
 
 async def run():
@@ -132,7 +142,7 @@ async def run():
             raise RuntimeError('Native runtime requires versioned provider-peer readiness support')
         rover.require_provider_ready=True
     bridge=SiteBridge(rover,derived(secret,'rover-site'),
-        {'forward':1,'reverse':2,'left':3,'right':4},snapshot=map_snapshot(),
+        {'forward':1,'reverse':2,'left':3,'right':4},snapshot=map_snapshot(rover),
         intent_ttl_ms=int(os.environ.get('ROVER_INTENT_TTL_MS','500')))
     application=bridge.app()
     async def inspect_stream(request):

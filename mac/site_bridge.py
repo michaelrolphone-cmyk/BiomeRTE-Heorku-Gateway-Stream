@@ -170,11 +170,12 @@ class SiteBridge:
         async def snapshot(request):
             body = await request.json()
             if body.get('world') is True:
-                if __package__:
-                    from .world_snapshot import world_snapshot
-                else:
-                    from world_snapshot import world_snapshot
-                return await world_snapshot(body)
+                from biomerte.stream_router import decode
+                cached = self.rover.bootstrap.get('world_snapshot')
+                if cached is None:
+                    raise web.HTTPServiceUnavailable(text='Waiting for streamed world snapshot')
+                value, _ = decode(cached)
+                return web.json_response(value)
             if self.snapshot is None:
                 return web.json_response({'error': {'code': 'MAP_SNAPSHOT_UNAVAILABLE',
                     'message': 'A revision-pinned map snapshot adapter is not configured.'}}, status=503)
@@ -285,10 +286,23 @@ class SiteBridge:
 
         app = web.Application(middlewares=[authenticate], client_max_size=0)
         app.router.add_post('/api/led', self.camera_light.handle)
-        from video_jobs import VideoJobs, video_handler
-        from pathlib import Path
-        app['video_jobs'] = VideoJobs(Path.home() / '.local/share/biome-robot-vision')
-        app.router.add_post('/api/video', video_handler)
+        async def video(request):
+            try:
+                body = await request.clone(client_max_size=524288).json()
+                if not isinstance(body, dict):
+                    raise ValueError('Expected video import request object')
+                action = body.get('action')
+                if action in ('list', 'status'):
+                    contract = 'robot.video.import.read:1'
+                elif action in ('create', 'chunk', 'finish', 'start', 'cancel'):
+                    contract = 'robot.video.import.write:1'
+                else:
+                    raise ValueError('Unknown video import action')
+                result = await self.rover.read_capability(contract, {'request': body})
+                return web.json_response(result, status=400 if result.get('ok') is False else 200)
+            except (ValueError, KeyError) as exc:
+                return web.json_response({'ok': False, 'error': {'code': 'VIDEO_INPUT', 'message': str(exc)}}, status=400)
+        app.router.add_post('/api/video', video)
         app.router.add_get('/api/state', state)
         app.router.add_post('/api/controls', controls)
         app.router.add_post('/api/map/snapshot', snapshot)
