@@ -19,10 +19,8 @@ from biomerte.rover import Rover
 from biomerte.control_clock import ControlClock
 from rover_transport import Outbound, derived, local_router
 from site_bridge import SiteBridge
+from rover_routes import ControllerRoutes
 
-MAC='217339021b2b3d61b16660da5562889be8e57e0636bdd9a5d129e3570c67ae4b'
-PI='687eda586198b9e7c2bdad0c6f69731b63552e6a650e6514c663f3d472c8f714'
-SITE='f45540bf9910412680734d0613e84460'
 GATEWAY='https://biomerte-controller.cantikash.chatgpt.site'
 PUBLIC='https://biomerte-stream-gateway-e0322b2b60c9.herokuapp.com'
 
@@ -50,31 +48,19 @@ class LocalAuthority:
         return value['result']
 
 
-class RoutedRemote:
+class RoutedRemote(ControllerRoutes):
     def __init__(self, app, home):
         self.app, self.home = app, home
         self.identity = read_json(str(home/'node.json'))
-        self.leases = {}
-        self.sessions = {}
-        self.operations = {}
+        super().__init__(app.node, home, self.signed_request)
 
-    def call(self, operation, arguments):
-        if operation in ('cap.acquire','cap.submit'):
-            controller = PI if arguments['resource'].startswith('relay6ch.') else MAC
-        elif operation == 'cap.status':
-            controller = self.operations[arguments['operation']]
-        elif 'lease' in arguments:
-            controller = self.leases[arguments['lease']]
-        elif 'session' in arguments:
-            controller = self.sessions[arguments['session']]
-        else:
-            raise ValueError('Unroutable Rover operation')
+    def signed_request(self, controller, operation, arguments):
         request_id = uuid.uuid4().hex
-        envelope = dict(site=SITE, realm='site', operation=operation,
+        envelope = dict(site=self.app.config['site'], realm='site', operation=operation,
                         arguments=arguments, id=request_id, controller=controller)
         auth = dict(actor=self.identity['node'],
                     signature=sign(str(self.home/'node.key'), envelope))
-        if controller == MAC:
+        if controller == self.app.node:
             result = self.app.call(operation, arguments, request_id, auth=auth,
                                    realm='site', controller=controller)
         else:
@@ -87,21 +73,8 @@ class RoutedRemote:
             if 'error' in value:
                 raise ConnectionError('Controller rejected Rover request')
             result = value['result']
-        if operation == 'cap.submit':
-            self.operations[arguments['operation']] = controller
-        if operation == 'cap.status' and result.get('state') in ('succeeded','failed','abandoned','denied','cancelled','uncertain'):
-            self.operations.pop(arguments['operation'], None)
-        if operation == 'cap.acquire':
-            self.leases[result['id']] = controller
-        if operation in ('stream.open','stream.attach'):
-            self.sessions[result['id']] = controller
-        if operation == 'stream.list':
-            self.sessions.update({item['id']:controller for item in result})
-        if operation == 'stream.close':
-            self.sessions.pop(arguments['session'], None)
-        if operation == 'cap.release' and result.get('state') == 'released':
-            self.leases.pop(arguments['lease'], None)
         return result
+
 
 
 class FreshRover(Rover):
