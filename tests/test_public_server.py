@@ -9,6 +9,28 @@ import contextlib
 from test_router_integration import grant,token,NODE,SECRET
 
 class PublicServerTests(unittest.IsolatedAsyncioTestCase):
+
+ async def test_service_coordinator_routes_precede_rover_api_fallback(self):
+  from biomerte.service_coordinator import coordinator_key
+  runner=web.AppRunner(application({'secrets':{NODE:SECRET},'inspect_url':'https://gateway/inspect'}))
+  await runner.setup();self.addAsyncCleanup(runner.cleanup)
+  site=web.TCPSite(runner,'127.0.0.1',0);await site.start()
+  base='http://127.0.0.1:'+str(site._server.sockets[0].getsockname()[1])
+  headers={'Authorization':'Bearer '+coordinator_key(SECRET)}
+  async with ClientSession() as client:
+   async with client.get(base+'/api/service-coordinator/status',headers=headers) as response:
+    self.assertEqual(200,response.status)
+    self.assertEqual('single_process',(await response.json())['authority_mode'])
+   async with client.post(base+'/api/service-coordinator/catalog',headers=headers,json={}) as response:
+    self.assertEqual(200,response.status)
+    self.assertEqual([],(await response.json())['manifests'])
+   async with client.get(base+'/api/service-coordinator/status') as response:
+    self.assertEqual(401,response.status)
+   async with client.get(base+'/api/service-coordinator/status',headers={'Authorization':'Bearer '+SECRET}) as response:
+    self.assertEqual(401,response.status)
+   async with client.get(base+'/api/state',headers={'Authorization':'Bearer '+derived(SECRET,'rover-site')}) as response:
+    self.assertEqual(503,response.status)
+
  async def test_mac_owner_pairs_local_server_with_public_provider_and_revokes(self):
   g=grant();router=Router({NODE:SECRET},{NODE:lambda sid:dict(g)})
   async def start(app):

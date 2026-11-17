@@ -72,9 +72,10 @@ def application(config):
             await socket.close(code=1008, message=b'Stream rejected')
         return socket
     app.router.add_get('/health', health)
+    # Specific coordinator routes precede the Rover /api/{tail:.*} fallback.
+    coordinator.mount(app)
     ingress.mount(app)
     authorities.mount(app)
-    coordinator.mount(app)
     app.router.add_get('/{session:[a-f0-9]{32}}/{lane:[a-z_]+}', stream)
     async def close(app):
         await authorities.close()
