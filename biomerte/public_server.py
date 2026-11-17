@@ -4,6 +4,7 @@ from aiohttp import web, WSMsgType
 from .stream_router import Router, _inspect
 from .rover_transport import Ingress
 from .authority_transport import Authorities
+from .service_coordinator import Coordinator
 
 
 class Socket:
@@ -33,6 +34,9 @@ def application(config):
         raise ValueError('Authenticated HTTPS stream.inspect URL required')
     ingress = Ingress(next(iter(secrets.values())))
     authorities = Authorities(secrets)
+    coordinator = Coordinator(
+        config.get('service_coordinator_secret', next(iter(secrets.values()))),
+        max_lease_ttl_s=config.get('service_coordinator_max_lease_ttl_s', 30))
     loop=asyncio.get_running_loop()
     def validate(sid,node):
         if node==config.get('rover_authority') and ingress.link is not None:
@@ -68,6 +72,8 @@ def application(config):
             await socket.close(code=1008, message=b'Stream rejected')
         return socket
     app.router.add_get('/health', health)
+    # Specific coordinator routes precede the Rover /api/{tail:.*} fallback.
+    coordinator.mount(app)
     ingress.mount(app)
     authorities.mount(app)
     app.router.add_get('/{session:[a-f0-9]{32}}/{lane:[a-z_]+}', stream)
