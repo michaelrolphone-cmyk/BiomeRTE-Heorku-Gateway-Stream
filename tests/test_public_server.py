@@ -21,6 +21,13 @@ class PublicServerTests(unittest.IsolatedAsyncioTestCase):
    async with client.get(base+'/api/service-coordinator/status',headers=headers) as response:
     self.assertEqual(200,response.status)
     self.assertEqual('single_process',(await response.json())['authority_mode'])
+   async with client.post(base+'/api/service-coordinator/validate-preparation',headers=headers,json={}) as response:
+    self.assertEqual(200,response.status)
+    self.assertFalse((await response.json())['valid'])
+   async with client.post(base+'/api/service-authorities/resolve',json={}) as response:
+    self.assertEqual(400,response.status)
+   async with client.post(base+'/api/service-checkpoints/status',headers=headers,json={'service_id':'unknown','workers':[]}) as response:
+    self.assertEqual(404,response.status)
    async with client.post(base+'/api/service-coordinator/catalog',headers=headers,json={}) as response:
     self.assertEqual(200,response.status)
     self.assertEqual([],(await response.json())['manifests'])

@@ -1,10 +1,12 @@
 """Heroku public ingress: native streams plus reverse Mac Rover transport."""
 import asyncio
 from aiohttp import web, WSMsgType
-from .stream_router import Router, _inspect
+from .stream_router import Router, _inspect, service_routes
 from .rover_transport import Ingress
 from .authority_transport import Authorities
 from .service_coordinator import Coordinator
+from .service_transport import ServiceAuthorities
+from .checkpoint_transport import CheckpointWorkers
 
 
 class Socket:
@@ -33,17 +35,30 @@ def application(config):
     if not inspect.startswith('https://'):
         raise ValueError('Authenticated HTTPS stream.inspect URL required')
     ingress = Ingress(next(iter(secrets.values())))
-    authorities = Authorities(secrets)
     coordinator = Coordinator(
         config.get('service_coordinator_secret', next(iter(secrets.values()))),
-        max_lease_ttl_s=config.get('service_coordinator_max_lease_ttl_s', 30))
+        max_lease_ttl_s=config.get('service_coordinator_max_lease_ttl_s', 30),
+        reserved_authorities=secrets)
+    for manifest in config.get("service_manifests", []):
+        coordinator.configure(manifest)
+    services = ServiceAuthorities(coordinator,
+        config.get("service_authority_secret", next(iter(secrets.values()))))
+    checkpoints = CheckpointWorkers(coordinator)
+    authorities = Authorities(secrets, services=services)
     loop=asyncio.get_running_loop()
     def validate(sid,node):
         if node==config.get('rover_authority') and ingress.link is not None:
             return asyncio.run_coroutine_threadsafe(ingress.inspect(node,sid),loop).result(6)
         return _inspect(inspect,sid,node,secrets[node])
     validators={node:(lambda sid,node=node:validate(sid,node)) for node in secrets}
-    router=Router(secrets,validators)
+    def inspect_service(node, sid):
+        reply = asyncio.run_coroutine_threadsafe(services.inspect(node, sid), loop).result(6)
+        if reply["status"] != 200:
+            raise ConnectionError("Logical authority rejected stream inspection")
+        return reply["grant"]
+    router_secrets, router_validators = service_routes(
+        secrets, validators, services.secret, inspect_service)
+    router=Router(router_secrets,router_validators)
     owner=config.get('router_owner','hosted')
     if owner not in ('hosted','mac_bridge'):
         raise ValueError('Unknown native session owner')
@@ -52,6 +67,8 @@ def application(config):
         return web.json_response({'state':'ready','protocol':'leased-stream-inspect-v1',
             'authorities':sorted(secrets),
             'authority_inspection_links':sorted(authorities.links),'sessions':len(router.sessions),
+            'service_authority_links':sorted(services.links),
+            'service_checkpoint_workers':sorted(checkpoints.links),
             'rover_bridge':ingress.link is not None,
             'session_owner':owner,
             'telemetry_header_limit_bytes':None,'telemetry_packet_limit_bytes':None,
@@ -74,11 +91,15 @@ def application(config):
     app.router.add_get('/health', health)
     # Specific coordinator routes precede the Rover /api/{tail:.*} fallback.
     coordinator.mount(app)
+    services.mount(app)
+    checkpoints.mount(app)
     ingress.mount(app)
     authorities.mount(app)
     app.router.add_get('/{session:[a-f0-9]{32}}/{lane:[a-z_]+}', stream)
     async def close(app):
         await authorities.close()
+        await services.close()
+        await checkpoints.close()
         await asyncio.gather(*(s.close('Router stopped') for s in list(router.sessions.values())),
                              return_exceptions=True)
         tasks = list(router.tasks.values())

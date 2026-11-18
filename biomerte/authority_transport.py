@@ -15,8 +15,9 @@ def authority_key(secret, authority):
 
 
 class Authorities:
-    def __init__(self, secrets, limit=64, timeout=5):
+    def __init__(self, secrets, limit=64, timeout=5, services=None):
         self.secrets = dict(secrets)
+        self.services = services
         self.links = {}
         self.pending = {}
         self.limit = limit
@@ -66,6 +67,8 @@ class Authorities:
         return socket
 
     async def inspect(self, authority, session):
+        if self.services is not None and self.services.scope(authority=authority):
+            return await self.services.inspect(authority, session)
         socket = self.links.get(authority)
         if socket is None or socket.closed:
             raise web.HTTPServiceUnavailable(text='Authority disconnected')
@@ -94,7 +97,11 @@ class Authorities:
             if not isinstance(value, dict) or set(value) != {'authority', 'session', 'timestamp'}:
                 raise ValueError()
             authority, session, timestamp = (value[k] for k in ('authority', 'session', 'timestamp'))
-            secret = self.secrets[authority]
+            secret = self.secrets.get(authority)
+            if secret is None and self.services is not None:
+                secret = self.services.inspection_secret(authority)
+            if secret is None:
+                raise ValueError()
             if (not isinstance(session, str) or not re.fullmatch('[a-f0-9]{32}', session)
                     or type(timestamp) is not int or abs(time.time() - timestamp) > 30):
                 raise ValueError()

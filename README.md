@@ -81,7 +81,7 @@ biomerte/heroku_stream_router.py   generates config from env and starts the rout
 
 - Session state is in-process. A dyno restart drops live sessions; clients re-attach under the existing lease and epoch rules.
 - One dyno only. Multiple dynos need sticky routing or shared session state, which the current router does not have.
-- If Heroku is unreachable from the field, streaming stops. Discrete capability leases and destinations do not depend on this dyno.
+- If Heroku is unreachable from the field, streaming stops. Native discrete capability leases and destinations keep their existing controller paths. Portable Docker authority admission depends on the current gateway placement witness.
 
 ## Rover intent lifetime
 
@@ -94,3 +94,18 @@ with NTP. A server acceptance is separate from provider received/applied feedbac
 
 ## Telemetry sizes
 Telemetry headers and packets have no artificial byte cap. Complete JSON metadata is preserved; framing lengths, identities and epochs remain validated. Superseded camera frames remain latest-only.
+
+## Portable Docker services
+
+The single-process service coordinator can place a manifest-defined Docker
+service on either controller. Logical authority connections are bound to the
+exact current placement; stateful authorities must publish a verified checkpoint
+baseline and establish their external fence before effects are admitted.
+Independent per-host helpers retain and transfer checkpoints while the gateway
+keeps only current placement and high-water metadata in memory.
+
+[Portable service authorities](docs/portable-service-authorities.md) describes
+the manifest, preparation and effect gates, outbound authority/helper protocols,
+checkpoint publication, native stream-router integration, and Rover routing.
+Existing native authorities remain supported. New Rover work resolves logical
+services first; existing lease, session, and pending command origins stay pinned.

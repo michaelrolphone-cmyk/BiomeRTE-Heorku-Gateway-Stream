@@ -13,6 +13,8 @@ import struct
 import time
 import urllib.request
 
+from .service_inspection import service_authority_key, service_routes, add_services
+
 
 class Fault(Exception):
     def __init__(self, message, status=400):
@@ -225,7 +227,7 @@ class Router:
 
 
 def _inspect(url, session_id, authority, secret):
-    raw = encode({'session': session_id, 'authority': authority, 'timestamp': time.time()}).encode()
+    raw = encode({'session': session_id, 'authority': authority, 'timestamp': int(time.time())}).encode()
     signature = hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
     req = urllib.request.Request(url, data=raw,
         headers={'Content-Type': 'application/json', 'Authorization': 'Router ' + signature,
@@ -243,6 +245,7 @@ async def serve(config):
         raise ValueError('Authenticated HTTPS stream.inspect URL is required')
     for node in secrets:
         validators[node] = lambda sid, node=node: _inspect(inspect, sid, node, secrets[node])
+    secrets, validators = add_services(config, secrets, validators)
     router = Router(secrets, validators)
     ssl_context = None
     if config.get('certificate') and config.get('key'):
