@@ -13,42 +13,62 @@ import time
 import urllib.request
 import uuid
 from aiohttp import web
-from biomerte.app import Application, read_json
+from biomerte.app import read_json
 from biomerte.identity import sign
 from biomerte.rover import Rover
 from biomerte.control_clock import ControlClock
+from biomerte.service_routing import ServiceOwnerResolver
 from rover_transport import Outbound, derived, local_router
 from site_bridge import SiteBridge
+from rover_routes import ControllerRoutes
 
-MAC='217339021b2b3d61b16660da5562889be8e57e0636bdd9a5d129e3570c67ae4b'
-PI='687eda586198b9e7c2bdad0c6f69731b63552e6a650e6514c663f3d472c8f714'
-SITE='f45540bf9910412680734d0613e84460'
 GATEWAY='https://biomerte-controller.cantikash.chatgpt.site'
 PUBLIC='https://biomerte-stream-gateway-e0322b2b60c9.herokuapp.com'
 
 
-class RoutedRemote:
-    def __init__(self, app, home):
+class LocalAuthority:
+    """Use the running controller API; never run a bundled authority on its database."""
+    def __init__(self, directory, caller_home):
+        self.config = read_json(str(pathlib.Path(directory)/'node.json'))
+        self.node = self.config['node']
+        self.caller_home = pathlib.Path(caller_home)
+        self.identity = read_json(str(self.caller_home/'node.json'))
+
+    def call(self, operation, arguments, request_id, auth=None, realm='site', controller=None):
+        envelope = dict(site=self.config['site'], realm=realm, operation=operation,
+                        arguments=arguments, id=request_id, controller=controller or self.node)
+        envelope['auth'] = auth or dict(actor=self.identity['node'],
+            signature=sign(str(self.caller_home/'node.key'), envelope))
+        request = urllib.request.Request('http://127.0.0.1:8740/v1/call',
+            data=json.dumps(envelope).encode(), headers={'Content-Type':'application/json',
+            'User-Agent':'BiomeRTE-Rover-Server/1'})
+        with urllib.request.urlopen(request, timeout=20) as response:
+            value = json.load(response)
+        if 'error' in value:
+            raise ConnectionError('Controller rejected Rover request: '+str(value['error']))
+        return value['result']
+
+
+class RoutedRemote(ControllerRoutes):
+    def __init__(self, app, home, *, resolver=None):
         self.app, self.home = app, home
         self.identity = read_json(str(home/'node.json'))
-        self.leases = {}
-        self.sessions = {}
+        self.service_resolver = resolver if resolver is not None else ServiceOwnerResolver(
+            PUBLIC, declarations=lambda: read_json(str(home/'node.json')).get(
+                'service_authority_declarations', []))
+        super().__init__(app.node, home, self.signed_request)
 
-    def call(self, operation, arguments):
-        if operation == 'cap.acquire':
-            controller = PI if arguments['resource'].startswith('relay6ch.') else MAC
-        elif 'lease' in arguments:
-            controller = self.leases[arguments['lease']]
-        elif 'session' in arguments:
-            controller = self.sessions[arguments['session']]
-        else:
-            raise ValueError('Unroutable Rover operation')
+    def resolve_new(self, contract, resource):
+        owner = self.service_resolver(resource)
+        return owner if owner is not None else super().resolve_new(contract, resource)
+
+    def signed_request(self, controller, operation, arguments):
         request_id = uuid.uuid4().hex
-        envelope = dict(site=SITE, realm='site', operation=operation,
+        envelope = dict(site=self.app.config['site'], realm='site', operation=operation,
                         arguments=arguments, id=request_id, controller=controller)
         auth = dict(actor=self.identity['node'],
                     signature=sign(str(self.home/'node.key'), envelope))
-        if controller == MAC:
+        if controller == self.app.node:
             result = self.app.call(operation, arguments, request_id, auth=auth,
                                    realm='site', controller=controller)
         else:
@@ -61,17 +81,8 @@ class RoutedRemote:
             if 'error' in value:
                 raise ConnectionError('Controller rejected Rover request')
             result = value['result']
-        if operation == 'cap.acquire':
-            self.leases[result['id']] = controller
-        if operation in ('stream.open','stream.attach'):
-            self.sessions[result['id']] = controller
-        if operation == 'stream.list':
-            self.sessions.update({item['id']:controller for item in result})
-        if operation == 'stream.close':
-            self.sessions.pop(arguments['session'], None)
-        if operation == 'cap.release' and result.get('state') == 'released':
-            self.leases.pop(arguments['lease'], None)
         return result
+
 
 
 class FreshRover(Rover):
@@ -100,6 +111,8 @@ class FreshRover(Rover):
         if lane == 'vision':
             from biomerte.stream_router import decode
             metadata, unused = decode(message)
+            if metadata.get('type') in ('sensor_manifest', 'world_snapshot'):
+                return super().broadcast(lane, message)
             processed = metadata.get('processed_monotonic')
             # Provider and server share this Mac's monotonic clock. This bound
             # is explicitly processing-to-server, not camera capture latency.
@@ -108,11 +121,12 @@ class FreshRover(Rover):
         super().broadcast(lane, message)
 
 
-def map_snapshot():
-    from biome_provider import VisionClient
-    from map_snapshot import reader
-    client = VisionClient(pathlib.Path.home()/'.local/share/biome-robot-vision/vision.sock', timeout=10)
-    return reader(client)
+def map_snapshot(rover):
+    async def read(map_id, revision):
+        if not isinstance(map_id, str) or type(revision) is not int or revision < 0:
+            raise web.HTTPBadRequest(text='Expected map ID and revision')
+        return await rover.read_capability('robot.map.snapshot:1', {'map_id':map_id, 'revision':revision})
+    return read
 
 
 async def run():
@@ -120,7 +134,7 @@ async def run():
     from logging.handlers import RotatingFileHandler
     logging.basicConfig(level=logging.WARNING,handlers=[RotatingFileHandler(
         home/'runtime.log',maxBytes=1048576,backupCount=1)])
-    app=Application(str(pathlib.Path.home()/'.local/share/biomerte-controller'))
+    app=LocalAuthority(pathlib.Path.home()/'.local/share/biomerte-controller',home)
     secret=app.config['stream_router_secret']
     remote=RoutedRemote(app,home)
     clock=await ControlClock().start()
@@ -132,7 +146,7 @@ async def run():
             raise RuntimeError('Native runtime requires versioned provider-peer readiness support')
         rover.require_provider_ready=True
     bridge=SiteBridge(rover,derived(secret,'rover-site'),
-        {'forward':1,'reverse':2,'left':3,'right':4},snapshot=map_snapshot(),
+        {'forward':1,'reverse':2,'left':3,'right':4},snapshot=map_snapshot(rover),
         intent_ttl_ms=int(os.environ.get('ROVER_INTENT_TTL_MS','500')))
     application=bridge.app()
     async def inspect_stream(request):

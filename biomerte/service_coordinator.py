@@ -21,6 +21,20 @@ PROTOCOL = "biomerte-service-coordinator/1"
 KEY_CONTEXT = b"biomerte/service-coordinator/v1"
 DIGEST = re.compile(r"(?:sha256:[0-9a-f]{64}|[^\s]+@sha256:[0-9a-f]{64})\Z")
 REVISION = re.compile(r"[0-9a-f]{64}\Z")
+ADAPTER_PROTOCOL = "biomerte-service-adapter/1"
+BINDING_KEYS = ("service_id", "manifest_revision", "worker_id",
+                "worker_incarnation", "boot_epoch", "grant_token")
+
+
+def grant_binding(value):
+    """The complete identity of one placement, never a host-only identity."""
+    return {key: value[key] for key in BINDING_KEYS}
+
+
+def exact_binding(value, grant):
+    return (isinstance(value, dict) and set(value) == set(BINDING_KEYS) and
+            all(isinstance(value.get(key), str) and value[key] == grant.get(key)
+                for key in BINDING_KEYS))
 
 
 def coordinator_key(secret):
@@ -57,13 +71,16 @@ class Conflict(ValueError):
 class Coordinator:
     """Synchronous transitions run atomically in aiohttp's single event loop."""
 
-    def __init__(self, secret, *, max_lease_ttl_s=30, clock=time.monotonic):
+    def __init__(self, secret, *, max_lease_ttl_s=30, clock=time.monotonic,
+                 reserved_authorities=(), checkpoint_head=None):
         self.key = coordinator_key(secret)
         self.max_lease_ttl_s = _number(max_lease_ttl_s, "max_lease_ttl_s")
         self.clock = clock
         self.boot_epoch = uuid.uuid4().hex
         self.boot_until = clock() + self.max_lease_ttl_s
         self.services = {}
+        self.reserved_authorities = frozenset(reserved_authorities)
+        self.checkpoint_head = checkpoint_head
 
     def _manifest(self, value):
         if not isinstance(value, dict):
@@ -99,6 +116,38 @@ class Coordinator:
             raise ValueError("preferred_workers must be a unique ordered list")
         for worker in preferred:
             _text(worker, "preferred worker")
+        activation = value.get("activation")
+        if activation is not None:
+            if (not isinstance(activation, dict) or
+                    activation.get("protocol") != ADAPTER_PROTOCOL):
+                raise ValueError("unsupported activation protocol")
+            _text(activation.get("binding"), "activation.binding")
+            if effect != "externally_fenced":
+                raise ValueError("an activation adapter requires external fencing")
+        authority = value.get("authority")
+        if authority is not None:
+            if not activation or not isinstance(authority, dict):
+                raise ValueError("logical authority requires an activation adapter")
+            identity = authority.get("id")
+            if (not isinstance(identity, str) or not REVISION.fullmatch(identity) or
+                    identity in self.reserved_authorities):
+                raise ValueError("logical authority must be distinct from native authorities")
+            for name in ("resources", "providers"):
+                entries = authority.get(name)
+                if (not isinstance(entries, list) or not entries or
+                        any(not isinstance(entry, str) or not entry for entry in entries) or
+                        len(set(entries)) != len(entries)):
+                    raise ValueError("authority." + name + " must contain unique exact identities")
+            if any(not REVISION.fullmatch(p) for p in authority["providers"]):
+                raise ValueError("authority.providers must contain actor IDs")
+            for sid, item in self.services.items():
+                other = item["manifest"].get("authority")
+                if sid == value["id"] or other is None:
+                    continue
+                if (identity == other["id"] or
+                        set(authority["resources"]) & set(other["resources"]) or
+                        set(authority["providers"]) & set(other["providers"])):
+                    raise ValueError("logical authority scope is already registered")
         return value
 
     def _new_service(self, manifest, now):
@@ -156,7 +205,44 @@ class Coordinator:
             return "worker_released"
         return None
 
+    def _state_ready(self, item, candidate, grant):
+        if not item["manifest"].get("activation"):
+            return True
+        proof = candidate.get("state_proof")
+        ready = (candidate.get("state_ready") is True and isinstance(proof, dict) and
+                 proof.get("protocol") == ADAPTER_PROTOCOL and
+                 exact_binding(proof.get("binding"), grant) and
+                 isinstance(proof.get("checkpoint"), str) and
+                 REVISION.fullmatch(proof["checkpoint"]) is not None and
+                 all(proof.get(flag) is True
+                     for flag in ("fresh", "custody_complete", "ready")))
+        if not ready or not item["manifest"].get("authority"):
+            return ready
+        # The preparation baseline must first be published durably by helpers.
+        # It stays bound to B as newer live checkpoints advance the high water.
+        head = self.checkpoint_head(grant["service_id"]) if self.checkpoint_head else None
+        if (not head or head.get("boot_epoch") != self.boot_epoch or
+                not exact_binding(head.get("binding"), grant)):
+            return False
+        baseline = grant.get("prepared_checkpoint")
+        if baseline is not None:
+            return (baseline["digest"] == proof["checkpoint"] and
+                    head["sequence"] >= baseline["sequence"])
+        if head.get("digest") != proof["checkpoint"]:
+            return False
+        grant["prepared_checkpoint"] = {"digest": head["digest"], "sequence": head["sequence"]}
+        return True
+
     def _fence_ready(self, item, candidate, grant):
+        if item["manifest"].get("activation"):
+            # An older successful proof cannot mask a new missing/stale proof.
+            ack = candidate.get("fence_ack")
+            return (self._state_ready(item, candidate, grant) and
+                    isinstance(ack, dict) and ack.get("fenced") is True and
+                    exact_binding(ack.get("binding"), grant) and
+                    ack.get("boot_epoch") == self.boot_epoch and
+                    ack.get("grant_token") == grant["grant_token"] and
+                    ack.get("checkpoint") == candidate["state_proof"]["checkpoint"])
         if item["manifest"]["effect_policy"] != "externally_fenced":
             return True
         ack = grant.get("fence_ack") or candidate.get("fence_ack")
@@ -190,6 +276,13 @@ class Coordinator:
                 item["reason"] = reason
             if grant["draining"]:
                 return
+            if not self._state_ready(item, candidate, grant):
+                if now - grant["started"] >= manifest.get("startup_grace_s", 20):
+                    grant["draining"] = True
+                    item["reason"] = "state_preparation_timeout"
+                else:
+                    item["reason"] = "awaiting_state_preparation"
+                return
             if (manifest["effect_policy"] == "externally_fenced" and
                     not self._fence_ready(item, candidate, grant)):
                 if now - grant["started"] >= manifest.get("startup_grace_s", 20):
@@ -220,7 +313,8 @@ class Coordinator:
             worker_id=worker_key[0], worker_incarnation=worker_key[1],
             started=now, expires=now + manifest.get("lease_ttl_s", 10),
             draining=False)
-        item["reason"] = ("awaiting_external_fence"
+        item["reason"] = ("awaiting_state_preparation" if manifest.get("activation") else
+                          "awaiting_external_fence"
                           if manifest["effect_policy"] == "externally_fenced"
                           else "starting")
 
@@ -236,7 +330,8 @@ class Coordinator:
             self._reconcile(service_id, item, now)
             retention = max(300, self.max_lease_ttl_s * 4,
                             item["manifest"].get("worker_ttl_s", 10) * 4)
-            if (not item["candidates"] and item["grant"] is None and
+            if (not item["manifest"].get("authority") and
+                    not item["candidates"] and item["grant"] is None and
                     now - item["last_seen"] >= retention):
                 del self.services[service_id]
 
@@ -285,7 +380,9 @@ class Coordinator:
                 candidate = dict(seen=now, manifest_revision=manifest["revision"],
                     platform=platform, image_ref=image_ref, prepared=row["prepared"],
                     dependencies_ready=row["dependencies_ready"],
-                    healthy=row.get("healthy"), fence_ack=row.get("fence_ack"))
+                    healthy=row.get("healthy"), fence_ack=row.get("fence_ack"),
+                    state_ready=row.get("state_ready"), state_proof=row.get("state_proof"),
+                    checkpoint=row.get("checkpoint"))
                 item["candidates"][(worker, incarnation)] = candidate
                 item["last_seen"] = now
                 accepted_ids.add(service_id)
@@ -322,6 +419,7 @@ class Coordinator:
             "worker_id", "worker_incarnation")}
         value.update(lease_ttl_s=max(0, grant["expires"] - now),
                      state=item["reason"],
+                     state_ready=self._state_ready(item, candidate, grant),
                      effect_ready=self._fence_ready(item, candidate, grant))
         return value
 
@@ -338,7 +436,8 @@ class Coordinator:
                         lease_ttl_s=max(0, grant["expires"] - now),
                         draining=grant["draining"]) if grant else None),
             candidates=[dict(worker_id=key[0], worker_incarnation=key[1],
-                             reason=self._candidate_reason(item, candidate, now))
+                             reason=self._candidate_reason(item, candidate, now),
+                             checkpoint=candidate.get("checkpoint"))
                         for key, candidate in sorted(item["candidates"].items())])
 
     def _catalog_manifests(self):
@@ -370,6 +469,52 @@ class Coordinator:
             services={sid: self._summary(sid, item, now)
                       for sid, item in self.services.items()})
 
+    def validate_preparation(self, value):
+        """Admission for staging/recovery only; this is never an effect grant."""
+        now = self.clock()
+        self._prune(now)
+        item = self.services.get(value.get("service_id")) if isinstance(value, dict) else None
+        grant = item["grant"] if item else None
+        valid = bool(grant and exact_binding(value, grant) and
+                     grant["boot_epoch"] == self.boot_epoch and
+                     not grant["draining"] and now < grant["expires"] and
+                     grant["manifest_revision"] == item["manifest"]["revision"])
+        return dict(valid=valid, reason="valid_preparation" if valid else "stale_or_revoked_grant",
+                    boot_epoch=self.boot_epoch,
+                    lease_ttl_s=max(0, grant["expires"] - now) if valid else 0)
+
+    def current_grant(self, service_id, *, preparation=False):
+        now = self.clock()
+        self._prune(now)
+        item = self.services.get(service_id)
+        grant = item["grant"] if item else None
+        if not grant:
+            return None
+        binding = grant_binding(grant)
+        if not self.validate_preparation(binding)["valid"]:
+            return None
+        if not preparation and not self.validate(binding)["valid"]:
+            return None
+        return self._grant_view(item, now)
+
+    def worker_current(self, worker_id, worker_incarnation, service_id=None):
+        """Helpers follow supervisor liveness, independently of child health."""
+        now = self.clock()
+        self._prune(now)
+        incarnations = set()
+        eligible = False
+        for sid, item in self.services.items():
+            for (worker, incarnation), candidate in item["candidates"].items():
+                if worker != worker_id:
+                    continue
+                incarnations.add(incarnation)
+                if ((service_id is None or sid == service_id) and
+                        incarnation == worker_incarnation and
+                        candidate["manifest_revision"] == item["manifest"]["revision"] and
+                        not item.get("conflicting_revisions")):
+                    eligible = True
+        return eligible and incarnations == {worker_incarnation}
+
     def validate(self, value):
         now = self.clock()
         self._prune(now)
@@ -377,6 +522,8 @@ class Coordinator:
         grant = item["grant"] if item else None
         valid = bool(self._matches(grant, value) and not grant["draining"] and
                      (value.get("manifest_revision") in (None, grant["manifest_revision"])))
+        if valid and item["manifest"].get("activation"):
+            valid = exact_binding(value, grant)
         reason = "stale_or_revoked_grant"
         if valid:
             candidate = item["candidates"].get(grant["worker_key"], {})
@@ -428,6 +575,8 @@ class Coordinator:
                                                 body.get("expected_revision"))
                     elif operation == "validate":
                         result = self.validate(body)
+                    elif operation == "validate-preparation":
+                        result = self.validate_preparation(body)
                     elif operation == "release":
                         result = self.release(body)
                     else:
@@ -440,5 +589,5 @@ class Coordinator:
 
         app.router.add_get("/api/service-coordinator/{operation:status|catalog}", handler)
         app.router.add_post(
-            "/api/service-coordinator/{operation:heartbeat|configure|validate|release|catalog}",
+            "/api/service-coordinator/{operation:heartbeat|configure|validate|validate-preparation|release|catalog}",
             handler)
