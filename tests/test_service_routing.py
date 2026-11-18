@@ -26,13 +26,13 @@ class Reply(io.BytesIO):
         self.close()
 
 
-def runtime_class(name):
+def runtime_class(name, read_identity=None):
     # Execute the actual deployed routing adapter with explicit native
     # collaborators. Its native controller runtime is not vendored here.
     source = (pathlib.Path(__file__).parent.parent / "mac/rover_service.py").read_text()
     tree = ast.parse(source)
     node = next(item for item in tree.body if isinstance(item, ast.ClassDef) and item.name == name)
-    namespace = dict(read_json=lambda path: {"node": "4" * 64, "site": "site"},
+    namespace = dict(read_json=read_identity or (lambda path: {"node": "4" * 64, "site": "site"}),
         ServiceOwnerResolver=ServiceOwnerResolver, PUBLIC="https://gateway.example",
         GATEWAY="https://site.example", urllib=urllib, json=json, uuid=uuid, pathlib=pathlib,
         ControllerRoutes=ControllerRoutes, sign=lambda path, envelope: "signature")
@@ -60,7 +60,10 @@ class NativeApp:
 
 class ResolverTests(unittest.TestCase):
     def setUp(self):
-        self.resolver = ServiceOwnerResolver("https://gateway.example")
+        self.declarations = [dict(service_id="relay-authority", authority=LOGICAL,
+                                  resources=["resource"], providers=["5" * 64])]
+        self.resolver = ServiceOwnerResolver("https://gateway.example",
+                                             declarations=self.declarations)
         self.directory = tempfile.TemporaryDirectory()
         self.addCleanup(self.directory.cleanup)
         self.home = pathlib.Path(self.directory.name)
@@ -68,20 +71,23 @@ class ResolverTests(unittest.TestCase):
         candidates.start()
         self.addCleanup(candidates.stop)
 
-    def test_only_unmanaged_404_permits_native_resolution(self):
-        def error(code):
-            return urllib.error.HTTPError(self.resolver.url, code, "test", {}, None)
-        with patch("urllib.request.urlopen", side_effect=error(404)):
-            self.assertIsNone(self.resolver("resource"))
-        for status in (401, 409, 429, 500, 503):
-            with patch("urllib.request.urlopen", side_effect=error(status)):
+    def test_declared_scope_never_falls_back_even_if_witness_answers_404(self):
+        for status in (401, 404, 409, 429, 500, 503):
+            error = urllib.error.HTTPError(self.resolver.url, status, "test", {}, None)
+            with patch("urllib.request.urlopen", side_effect=error):
                 with self.assertRaises(ConnectionError):
                     self.resolver("resource")
 
+    def test_undeclared_native_resource_never_contacts_witness(self):
+        with patch("urllib.request.urlopen", side_effect=AssertionError("Native scope is independent")):
+            self.assertIsNone(self.resolver("native.vision"))
+            self.assertIsNone(ServiceOwnerResolver("https://gateway.example")("native.vision"))
+
     def test_validates_logical_authority_and_effect_readiness(self):
-        good = dict(authority=LOGICAL, effect_ready=True, state="active")
+        good = dict(service_id="relay-authority", authority=LOGICAL, effect_ready=True, state="active")
         for value in (dict(good, effect_ready=False), dict(good, state="awaiting_external_fence"),
-                      dict(good, authority="bad"), []):
+                      dict(good, authority="bad"), dict(good, authority=PI),
+                      dict(good, service_id="another-service"), []):
             with patch("urllib.request.urlopen", return_value=Reply(json.dumps(value).encode())):
                 with self.assertRaises(ConnectionError):
                     self.resolver("resource")
@@ -172,6 +178,17 @@ class ResolverTests(unittest.TestCase):
                 remote.call("stream.open", {"lease": "old"})
         self.assertEqual(PI, remote.leases["old"])
         resolver.assert_not_called()
+
+    def test_rover_reloads_trusted_declarations_for_new_work_without_restarting(self):
+        identity = {"node": "4" * 64, "site": "site", "service_authority_declarations": []}
+        remote = runtime_class("RoutedRemote", lambda path: identity)(NativeApp(), self.home)
+        with patch("urllib.request.urlopen", side_effect=AssertionError("Native resource needs no witness")):
+            self.assertEqual(MAC, remote.resolve_new(CONTRACT, "native.vision"))
+        identity["service_authority_declarations"] = [dict(service_id="relay-authority",
+            authority=LOGICAL, resources=["resource"], providers=["5" * 64])]
+        response = dict(service_id="relay-authority", authority=LOGICAL, effect_ready=True, state="active")
+        with patch("urllib.request.urlopen", return_value=Reply(json.dumps(response).encode())):
+            self.assertEqual(LOGICAL, remote.resolve_new(CONTRACT, "resource"))
 
     def test_local_authority_uses_running_api_and_preserves_signed_controller_scope(self):
         local = runtime_class("LocalAuthority")("/native", "/caller")

@@ -178,17 +178,38 @@ state and effect readiness. Resource/authority resolution requires effect
 readiness. Provider resolution may return a provisional registered endpoint so
 it can complete recovery operations.
 
-404 means the scope is unmanaged. 503 means a declared service is unavailable,
-or initial restart discovery is still in progress. A 503 never permits native
-fallback. Declared scopes stay reserved in this process even after all workers
-expire.
+At the gateway, 404 means its current catalog does not manage the scope. 503
+means a declared service is unavailable, or initial restart discovery is still
+in progress. Declared scopes stay reserved in this process even after all
+workers expire. Callers that already have a trusted logical scope declaration
+must never interpret a later 404 as permission to fall back to a native issuer.
 
-Rover resolves each new acquisition or previously unbound submission first.
-An unmanaged resource uses the deployed native ControllerRoutes offer-discovery
-path. Existing lease and stream IDs, and existing pending command IDs, retain
-their recorded authority. Resource-move detection for existing native work is
+Rover consults trusted local scope declarations for each new acquisition or
+previously unbound submission. Its private node.json field is:
+
+```json
+{
+  "service_authority_declarations": [{
+    "service_id": "relay-authority",
+    "authority": "<logical authority fingerprint>",
+    "resources": ["<exact resource ID>"],
+    "providers": ["<exact provider actor>"]
+  }]
+}
+```
+
+These declarations contain no host binding. Install or update them before
+enabling the corresponding logical scope. Rover reloads the field for new work,
+so adding a future service does not require replacing pinned existing origins.
+For a declared resource it requires an admitted gateway response with the exact
+declared service and authority; 404 and 503 both fail closed. Undeclared resources
+use the deployed native ControllerRoutes offer-discovery path without contacting
+the witness, so a witness outage does not interrupt unrelated native resources.
+
+Existing lease and stream IDs, and existing pending command IDs, retain their
+recorded authority. Resource-move detection for existing native work is
 preserved. There is no relay resource-prefix or Pi-host rule in the routing
-code, and no compatibility map is needed.
+code.
 
 The source preserves the deployed LocalAuthority HTTP client to the running
 native controller, pending submission bindings, exact native offer discovery,

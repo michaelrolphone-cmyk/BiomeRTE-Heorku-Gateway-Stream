@@ -107,5 +107,6 @@ keeps only current placement and high-water metadata in memory.
 [Portable service authorities](docs/portable-service-authorities.md) describes
 the manifest, preparation and effect gates, outbound authority/helper protocols,
 checkpoint publication, native stream-router integration, and Rover routing.
-Existing native authorities remain supported. New Rover work resolves logical
-services first; existing lease, session, and pending command origins stay pinned.
+Existing native authorities remain supported. New Rover work resolves declared
+logical scopes through the witness; unrelated native resources keep their native
+availability. Existing lease, session, and pending command origins stay pinned.

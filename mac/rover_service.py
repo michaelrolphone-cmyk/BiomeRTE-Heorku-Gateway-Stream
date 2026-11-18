@@ -53,7 +53,9 @@ class RoutedRemote(ControllerRoutes):
     def __init__(self, app, home, *, resolver=None):
         self.app, self.home = app, home
         self.identity = read_json(str(home/'node.json'))
-        self.service_resolver = resolver if resolver is not None else ServiceOwnerResolver(PUBLIC)
+        self.service_resolver = resolver if resolver is not None else ServiceOwnerResolver(
+            PUBLIC, declarations=lambda: read_json(str(home/'node.json')).get(
+                'service_authority_declarations', []))
         super().__init__(app.node, home, self.signed_request)
 
     def resolve_new(self, contract, resource):
