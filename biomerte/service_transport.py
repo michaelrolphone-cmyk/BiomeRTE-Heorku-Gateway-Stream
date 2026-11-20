@@ -152,7 +152,7 @@ class ServiceAuthorities:
                     if value["status"] == 200 and pending["reply_type"] == "inspect_result":
                         result = value.get("grant")
                         if (not isinstance(result, dict) or
-                                result.get("authority") != scope["id"] or
+                                result.get("authority") != pending["authority"] or
                                 result.get("id") != pending["session"]):
                             continue
                     pending["future"].set_result(value)
@@ -178,7 +178,8 @@ class ServiceAuthorities:
         identity = uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future()
         self.pending[identity] = dict(link=link, future=future,
-            reply_type=payload["type"] + "_result", session=payload.get("session"))
+            reply_type=payload["type"] + "_result", session=payload.get("session"),
+            authority=payload.get("authority"))
         try:
             await link["socket"].send_json(dict(payload, id=identity,
                 binding=link["binding"], preparation=preparation))
@@ -192,7 +193,7 @@ class ServiceAuthorities:
             self.pending.pop(identity, None)
 
     async def inspect(self, authority, session):
-        found = self.scope(authority=authority)
+        found = self.scope(authority=authority) or self.scope(controller=authority)
         if not found:
             self._unknown()
         return await self.rpc(found[0], dict(type="inspect", authority=authority, session=session))
