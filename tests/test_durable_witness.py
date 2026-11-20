@@ -154,6 +154,27 @@ class DurableWitnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.witness.current())
         self.assertEqual(0, self.coordinator.witness_deadline())
 
+    async def test_explicit_commit_refusal_immediately_fences_cached_authority(self):
+        self.assertTrue(self.witness.current())
+        self.metadata.lease["boot_id"] = "replacement-witness"
+        with self.assertRaises(WitnessError):
+            await self.witness.commit(packet(0, "a" * 64))
+        self.assertFalse(self.witness.current())
+        self.assertEqual(0, self.coordinator.witness_deadline())
+        self.assertTrue(self.coordinator.publication_pending("example"))
+
+    async def test_checkpoint_conflict_preserves_lease_and_adopts_exact_newer_head(self):
+        await self.witness.commit(packet(0, "a" * 64))
+        self.metadata.head = dict(service_id="example", scope_digest=SCOPE,
+                                  sequence=2, digest="c" * 64)
+        deadline = self.witness.deadline
+        with self.assertRaises(WitnessError):
+            await self.witness.commit(packet(1, "b" * 64, "a" * 64))
+        self.assertTrue(self.witness.current())
+        self.assertEqual(deadline, self.witness.deadline)
+        self.assertEqual("c" * 64, self.witness.head("example")["digest"])
+        self.assertFalse(self.coordinator.publication_pending("example"))
+
     async def test_network_latency_never_extends_witness_authority(self):
         self.clock.advance(41)
         restarted = Coordinator("coordinator", max_lease_ttl_s=10, clock=self.clock)

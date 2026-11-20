@@ -156,14 +156,23 @@ class DurableWitness:
             # of this same CAS permanently inadmissible. Other unknown outcomes
             # retain the publication barrier, including a timed-out HTTP write.
             raw = exc.value.get("head") if exc.status == 409 else None
-            if isinstance(raw, dict):
-                head = exact_head(raw)
-                target = candidate["checkpoint"]
-                if (head["service_id"] == service_id and
-                        (head["scope_digest"] != candidate["scope_digest"] or
-                         head["sequence"] >= target["sequence"])):
-                    self.heads[service_id] = head
-                    self.pending.pop(service_id, None)
+            if exc.status == 409:
+                if not isinstance(raw, dict):
+                    self.deadline = 0  # owner/epoch/quarantine refusal is definitive
+                else:
+                    try:
+                        head = exact_head(raw)
+                    except WitnessError:
+                        self.deadline = 0
+                        raise
+                    if head["service_id"] != service_id:
+                        self.deadline = 0
+                        raise
+                    target = candidate["checkpoint"]
+                    if (head["scope_digest"] != candidate["scope_digest"] or
+                            head["sequence"] >= target["sequence"]):
+                        self.heads[service_id] = head
+                        self.pending.pop(service_id, None)
             raise
         head = exact_head(response.get("head"))
         expected = dict(candidate["checkpoint"], service_id=service_id,
