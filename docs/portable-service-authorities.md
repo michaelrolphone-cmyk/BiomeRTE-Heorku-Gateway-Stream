@@ -130,6 +130,19 @@ The registration acknowledgement contains `type: registered`,
 remaining placement TTL. Only the current complete grant may register. An
 obsolete connection cannot replace the admitted connection.
 
+Registration retains a 5-second deadline. Application RPC replies have a separate
+20-second default budget (`ServiceAuthorities.rpc_timeout`); they no longer inherit
+the registration deadline. The Site proxy and relay firmware each allow 30 seconds
+for their request, leaving room for forwarding and response delivery.
+
+The authority can publish a checkpoint before a native call and again after a
+successful call. Each checkpoint replication phase allows up to 10 seconds for
+concurrent helper replies. Two full phases plus other work can still exceed the
+RPC budget: 20 seconds is not a worst-case execution guarantee. An RPC timeout
+removes the pending correlation and ignores a late reply; it does not cancel or
+replay work already dispatched. Placement and binding are still checked after
+every accepted reply.
+
 A call RPC is:
 
 ```json
