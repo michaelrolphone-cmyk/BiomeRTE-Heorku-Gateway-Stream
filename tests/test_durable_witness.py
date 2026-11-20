@@ -1,6 +1,7 @@
 import asyncio
 import copy
 import unittest
+from unittest.mock import AsyncMock, Mock
 
 from biomerte.durable_witness import DurableWitness, WitnessError, PROTOCOL
 from biomerte.service_coordinator import Coordinator
@@ -75,6 +76,30 @@ class DurableWitnessTests(unittest.IsolatedAsyncioTestCase):
         client = DurableWitness(None, coordinator, "https://gateway.test", "w" * 48, lease_s=40)
         client.request = self.metadata.request
         return client
+
+    async def test_http_request_identifies_client_and_preserves_authentication(self):
+        answer = dict(protocol=PROTOCOL, heads=[], next=None)
+        response = Mock(status=200)
+        response.json = AsyncMock(return_value=answer)
+        context = AsyncMock()
+        context.__aenter__.return_value = response
+        session = Mock()
+        session.post.return_value = context
+        client = DurableWitness(session, self.coordinator, "https://gateway.test",
+                                "w" * 48, lease_s=40)
+        owner = dict(boot_id="probe-owner-0000000000000000", epoch=1)
+
+        self.assertEqual(answer, await client.request("heads", owner=owner))
+
+        session.post.assert_called_once()
+        args, kwargs = session.post.call_args
+        self.assertEqual(("https://gateway.test/internal/service-witness/v1",), args)
+        self.assertEqual({"Authorization": "Bearer " + "w" * 48,
+                          "User-Agent": "BioMRT-Durable-Witness/1"}, kwargs["headers"])
+        self.assertEqual(dict(protocol=PROTOCOL, operation="heads",
+                              witness="biomerte-services", owner=owner), kwargs["json"])
+        self.assertFalse(kwargs["allow_redirects"])
+        self.assertEqual(client.timeout, kwargs["timeout"].total)
 
     async def test_lost_cas_response_blocks_replacement_until_exact_retry_is_reconciled(self):
         await self.witness.commit(packet(0, "a" * 64))

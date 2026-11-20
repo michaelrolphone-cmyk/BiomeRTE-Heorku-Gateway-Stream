@@ -66,7 +66,8 @@ class DurableWitness:
     async def request(self, operation, **body):
         async with self.session.post(self.url, json=dict(
                 protocol=PROTOCOL, operation=operation, witness=self.witness_id, **body),
-                headers={"Authorization": "Bearer " + self.secret},
+                headers={"Authorization": "Bearer " + self.secret,
+                         "User-Agent": "BioMRT-Durable-Witness/1"},
                 timeout=ClientTimeout(total=self.timeout), allow_redirects=False) as response:
             try:
                 value = await response.json()
