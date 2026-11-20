@@ -134,21 +134,37 @@ class Coordinator:
             if (not isinstance(identity, str) or not REVISION.fullmatch(identity) or
                     identity in self.reserved_authorities):
                 raise ValueError("logical authority must be distinct from native authorities")
+            kind = authority.get("kind", "resource")
+            if kind not in ("resource", "controller"):
+                raise ValueError("unsupported logical authority kind")
+            controller = kind == "controller"
             for name in ("resources", "providers"):
                 entries = authority.get(name)
-                if (not isinstance(entries, list) or not entries or
+                if (not isinstance(entries, list) or not controller and not entries or
                         any(not isinstance(entry, str) or not entry for entry in entries) or
                         len(set(entries)) != len(entries)):
                     raise ValueError("authority." + name + " must contain unique exact identities")
             if any(not REVISION.fullmatch(p) for p in authority["providers"]):
                 raise ValueError("authority.providers must contain actor IDs")
+            aliases = authority.get("controller_aliases", [])
+            if controller:
+                if (not isinstance(aliases, list) or not aliases or
+                        any(not isinstance(alias, str) or not REVISION.fullmatch(alias)
+                            or alias not in self.reserved_authorities for alias in aliases) or
+                        len(set(aliases)) != len(aliases)):
+                    raise ValueError("controller aliases must be unique registered native authorities")
+                if value.get("state_policy") != "externally_managed":
+                    raise ValueError("controller runtime requires externally managed durable state")
+            elif "controller_aliases" in authority:
+                raise ValueError("controller aliases require an explicit controller authority")
             for sid, item in self.services.items():
                 other = item["manifest"].get("authority")
                 if sid == value["id"] or other is None:
                     continue
                 if (identity == other["id"] or
                         set(authority["resources"]) & set(other["resources"]) or
-                        set(authority["providers"]) & set(other["providers"])):
+                        set(authority["providers"]) & set(other["providers"]) or
+                        set(aliases) & set(other.get("controller_aliases", []))):
                     raise ValueError("logical authority scope is already registered")
         wait = value.get("wait_for_external_fence", False)
         if type(wait) is not bool:
