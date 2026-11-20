@@ -511,6 +511,7 @@ class Coordinator:
         return dict(protocol=PROTOCOL, authority_mode="single_process",
             boot_epoch=self.boot_epoch, max_lease_ttl_s=self.max_lease_ttl_s,
             boot_grace_remaining_s=max(0, self.boot_until - now),
+            supported_features=["verified_external_fence_wait"],
             services={sid: self._summary(sid, item, now)
                       for sid, item in self.services.items()})
 

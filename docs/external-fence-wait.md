@@ -76,6 +76,11 @@ Run the targeted suite from an isolated checkout:
 PYTHONPATH=tests python -m unittest -v test_external_fence_wait test_service_activation test_service_coordinator test_service_transport
 ```
 
+The authenticated read-only coordinator status includes
+`supported_features: ["verified_external_fence_wait"]`. Verify this marker
+after deployment before opting in a manifest; it does not configure or admit
+any service.
+
 No production manifest is changed by this branch. The candidate requires review,
 successful tests, source correspondence and an explicit manifest opt-in before
 live use. Its expected benefit is to stop needless grant/intent churn while

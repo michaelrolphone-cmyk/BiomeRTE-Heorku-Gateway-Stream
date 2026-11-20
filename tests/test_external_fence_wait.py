@@ -22,7 +22,7 @@ class ExternalFenceWaitTests(unittest.TestCase):
     def setUp(self):
         self.prepare()
 
-    def prepare(self, enabled=True, **changes):
+    def prepare(self, enabled=True, live=True, **changes):
         self.clock = Clock()
         self.coordinator = Coordinator("secret", max_lease_ttl_s=10, clock=self.clock)
         self.spec = waiting_manifest(enabled, **changes)
@@ -32,7 +32,7 @@ class ExternalFenceWaitTests(unittest.TestCase):
         self.head = dict(service_id="example", sequence=1, digest="a" * 64,
                          binding=self.binding, boot_epoch=self.coordinator.boot_epoch)
         self.coordinator.checkpoint_head = lambda sid: self.head
-        self.live = True
+        self.live = live
         self.coordinator.preparation_connected = lambda b: self.live and b == self.binding
         self.proof = readiness(self.grant)
         self.proof.pop("fence_ack")
@@ -177,6 +177,22 @@ class ExternalFenceWaitTests(unittest.TestCase):
         self.assertEqual("active", self.grant["state"])
         self.assertEqual([], self.report(healthy=False, **ready)["assignments"])
 
+    def test_first_live_fence_ack_near_grace_gets_bounded_activation(self):
+        self.prepare(live=False)
+        for unused in range(3):
+            self.clock.advance(2)
+            self.report()
+        # The link registers just before the original grace ends. There has
+        # been no worker report of that wait when the real fence arrives.
+        self.clock.advance(1)
+        self.live = True
+        self.clock.advance(1.5)
+        result = self.report(**readiness(self.grant))
+        self.assertEqual(1, len(result["assignments"]))
+        self.assertEqual(self.binding, grant_binding(self.grant))
+        self.assertEqual("starting", self.grant["state"])
+        self.assertTrue(self.grant["effect_ready"])
+
     def test_activation_after_wait_still_has_a_bounded_health_window(self):
         self.wait_beyond_startup()
         ready = readiness(self.grant)
@@ -270,6 +286,15 @@ class ExternalFenceWaitTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.services.preparation_connected(self.binding))
         self.assertEqual([], self.renew()["assignments"])
         self.assertFalse(self.coordinator.validate_preparation(self.binding)["valid"])
+
+    async def test_authenticated_status_identifies_feature_without_configuration(self):
+        response = await self.client.get(self.base + "/api/service-coordinator/status",
+            headers={"Authorization": "Bearer " + self.coordinator.key})
+        self.assertEqual(200, response.status)
+        value = await response.json()
+        self.assertIn("verified_external_fence_wait", value["supported_features"])
+        self.assertEqual(self.spec, value["services"]["example"]["desired_manifest"])
+        self.assertNotIn(self.binding["grant_token"], str(value))
 
     async def test_live_socket_cannot_mask_explicit_process_failure(self):
         await self.connect()
