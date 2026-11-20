@@ -5,6 +5,8 @@ Helpers authenticate the package, retain high water locally, and fsync before
 acknowledging. A coordinator boot change invalidates every in-flight receipt.
 """
 import asyncio
+import base64
+import hashlib
 import json
 import re
 import uuid
@@ -15,6 +17,37 @@ from .service_transport import authorize_coordinator, REPLY_STATUSES
 
 
 PROTOCOL = "biomerte-service-checkpoint/1"
+BLOCK_BYTES = 256 * 1024
+
+
+def chunk_digest(value):
+    if not isinstance(value, str) or re.fullmatch("[0-9a-f]{64}", value) is None:
+        raise ValueError("Exact controller block digest required")
+    return value
+
+
+def chunk_payload(value, data=False):
+    if not isinstance(value, dict):
+        raise ValueError("Controller block descriptor required")
+    key = chunk_digest(value.get("digest"))
+    result = {"digest": key}
+    if data:
+        encoded = value.get("data")
+        if not isinstance(encoded, str) or len(encoded) > ((BLOCK_BYTES + 2) // 3) * 4:
+            raise ValueError("Bounded controller block required")
+        raw = base64.b64decode(encoded, validate=True)
+        if not 0 < len(raw) <= BLOCK_BYTES or hashlib.sha256(raw).hexdigest() != key:
+            raise ValueError("Controller block digest mismatch")
+        result.update(data=encoded, bytes=len(raw))
+    return result
+
+
+def chunk_keys(value):
+    if not isinstance(value, list) or len(value) > 256:
+        raise ValueError("At most 256 controller block digests required")
+    if len({chunk_digest(key) for key in value}) != len(value):
+        raise ValueError("Duplicate controller block digest")
+    return value
 
 
 def checkpoint_identity(value, service_id):
@@ -113,10 +146,29 @@ class CheckpointWorkers:
                         if (pending["checkpoint"] is not None and
                                 checkpoint != pending["checkpoint"]):
                             continue
-                        if (pending["operation"] == "checkpoint.put" and
+                        if (pending["operation"] in ("checkpoint.put", "checkpoint.published") and
                                 (not isinstance(reply.get("result"), dict) or
                                  reply["result"].get("durable") is not True)):
                             continue
+                        result = reply.get("result")
+                        if pending["operation"].startswith("checkpoint.chunk."):
+                            if checkpoint is not None or not isinstance(result, dict):
+                                continue
+                            expected_chunk = pending.get("chunk")
+                            if pending["operation"] == "checkpoint.chunk.put":
+                                if (result.get("digest") != expected_chunk["digest"] or
+                                        result.get("bytes") != expected_chunk["bytes"] or
+                                        result.get("durable") is not True):
+                                    continue
+                            elif pending["operation"] == "checkpoint.chunk.get":
+                                actual_chunk = chunk_payload(result, data=True)
+                                if (actual_chunk["digest"] != expected_chunk["digest"] or
+                                        result.get("bytes") != actual_chunk["bytes"]):
+                                    continue
+                            else:
+                                missing = chunk_keys(result.get("missing"))
+                                if not set(missing).issubset(pending["digests"]):
+                                    continue
                     pending["future"].set_result(reply)
                 except (ValueError, TypeError):
                     continue
@@ -131,7 +183,7 @@ class CheckpointWorkers:
                         pending["future"].set_exception(ConnectionError("Checkpoint helper disconnected"))
         return socket
 
-    async def rpc(self, worker, operation, service_id, *, binding=None, checkpoint=None):
+    async def rpc(self, worker, operation, service_id, *, binding=None, checkpoint=None, chunk=None, digests=None):
         key = worker_identity(worker)
         link = self.links.get(key[0])
         if not link or link["key"] != key or not self._current(key, link, service_id):
@@ -143,11 +195,13 @@ class CheckpointWorkers:
         future = asyncio.get_running_loop().create_future()
         expected = checkpoint_identity(checkpoint, service_id) if checkpoint is not None else None
         self.pending[identity] = dict(link=link, future=future, boot_epoch=epoch,
-            binding=binding, checkpoint=expected, operation=operation, service_id=service_id)
+            binding=binding, checkpoint=expected, operation=operation, service_id=service_id,
+            chunk=chunk, digests=digests)
         try:
             await link["socket"].send_json(dict(type=operation, id=identity,
                 worker_id=key[0], worker_incarnation=key[1], boot_epoch=epoch,
-                service_id=service_id, binding=binding, checkpoint=checkpoint))
+                service_id=service_id, binding=binding, checkpoint=checkpoint,
+                chunk=chunk, digests=digests))
             reply = await asyncio.wait_for(future, self.timeout)
             if (epoch != self.coordinator.boot_epoch or not self._current(key, link, service_id) or
                     (binding is not None and
@@ -198,6 +252,15 @@ class CheckpointWorkers:
                     acknowledgements.append(dict(target, checkpoint=identity, durable=True))
                 self.heads[service_id] = dict(identity, binding=dict(binding),
                                               boot_epoch=self.coordinator.boot_epoch)
+                if checkpoint["package"].get("payload", {}).get("state", {}).get("format") == "biomerte-controller-state/1":
+                    # This authenticated notification only permits local payload
+                    # GC after head publication. It is not another commit vote.
+                    await asyncio.gather(*(self.rpc(target, "checkpoint.published", service_id,
+                        binding=binding, checkpoint=identity) for target in targets),
+                        return_exceptions=True)
+                    if (self.coordinator.boot_epoch != self.head_epoch or
+                            not self.coordinator.validate_preparation(binding)["valid"]):
+                        raise web.HTTPServiceUnavailable(text="Checkpoint publication epoch changed")
                 return web.json_response(dict(protocol=PROTOCOL, binding=binding,
                     checkpoint=identity, head=self.heads[service_id], acknowledgements=acknowledgements),
                     headers={"Cache-Control": "no-store"})
@@ -206,6 +269,21 @@ class CheckpointWorkers:
                 raise ValueError("service_id is required")
             if service_id not in self.coordinator.services:
                 raise web.HTTPNotFound()
+            if operation in ("chunk-put", "chunk-get", "chunk-missing"):
+                binding = body.get("binding")
+                if (not isinstance(binding, dict) or binding.get("service_id") != service_id or
+                        not self.coordinator.validate_preparation(binding)["valid"]):
+                    raise web.HTTPConflict(text="Current complete preparation grant required")
+                chunk, digests = None, None
+                if operation == "chunk-missing":
+                    digests = chunk_keys(body.get("digests"))
+                else:
+                    chunk = chunk_payload(body.get("chunk"), data=operation == "chunk-put")
+                reply = await self.rpc(body.get("worker"),
+                    "checkpoint." + operation.replace("-", "."), service_id,
+                    binding=binding, chunk=chunk, digests=digests)
+                return web.json_response(reply, status=reply["status"],
+                                         headers={"Cache-Control": "no-store"})
             if operation == "get":
                 identity = checkpoint_identity(body.get("checkpoint"), service_id)
                 reply = await self.rpc(body.get("worker"), "checkpoint.get", service_id,
@@ -245,4 +323,4 @@ class CheckpointWorkers:
 
     def mount(self, app):
         app.router.add_get("/service-worker/{worker_id}/connect", self.connect)
-        app.router.add_post("/api/service-checkpoints/{operation:replicate|get|status}", self.request)
+        app.router.add_post("/api/service-checkpoints/{operation:replicate|get|status|chunk-put|chunk-get|chunk-missing}", self.request)
