@@ -7,6 +7,7 @@ after await, so a resumed old process cannot answer for a newer placement.
 import asyncio
 import hmac
 import json
+import math
 import re
 import uuid
 
@@ -32,7 +33,7 @@ def authorize_coordinator(request, coordinator):
 
 
 class ServiceAuthorities:
-    def __init__(self, coordinator, secret, *, limit=64, timeout=5):
+    def __init__(self, coordinator, secret, *, limit=64, timeout=5, heartbeat=15):
         self.coordinator = coordinator
         self.secret = secret
         self.links = {}
@@ -40,6 +41,21 @@ class ServiceAuthorities:
         self.closing = set()
         self.limit = limit
         self.timeout = timeout
+        if (type(heartbeat) not in (int, float) or not math.isfinite(heartbeat)
+                or heartbeat <= 0):
+            raise ValueError("Positive authority heartbeat required")
+        self.heartbeat = heartbeat
+        coordinator.preparation_connected = self.preparation_connected
+
+    def preparation_connected(self, binding):
+        """Observe this exact registered process without recursive admission.
+
+        Aiohttp's existing ping/pong heartbeat closes an unresponsive socket.
+        Coordinator checks still own the grant, worker and checkpoint gates.
+        """
+        link = self.links.get(binding["service_id"])
+        return bool(link and link.get("registered") and not link["socket"].closed
+                    and exact_binding(link["binding"], binding))
 
     def scopes(self):
         self.coordinator.status()
@@ -77,7 +93,7 @@ class ServiceAuthorities:
         service_id = request.match_info["service_id"]
         if service_id not in self.scopes():
             self._unknown()
-        socket = web.WebSocketResponse(heartbeat=15, max_msg_size=0)
+        socket = web.WebSocketResponse(heartbeat=self.heartbeat, max_msg_size=0)
         await socket.prepare(request)
         link = None
         try:
@@ -92,7 +108,7 @@ class ServiceAuthorities:
             if old and self._admitted(service_id, old, True):
                 await socket.close(code=1008, message=b"Current authority already connected")
                 return socket
-            link = dict(socket=socket, binding=dict(binding))
+            link = dict(socket=socket, binding=dict(binding), registered=False)
             self.links[service_id] = link
             if old:
                 closing = asyncio.create_task(old["socket"].close(
@@ -106,6 +122,7 @@ class ServiceAuthorities:
             scope = self.scopes()[service_id]
             await socket.send_json(dict(type="registered", protocol=PROTOCOL,
                 binding=binding, authority=scope["id"], lease_ttl_s=grant["lease_ttl_s"]))
+            link["registered"] = True
             async for message in socket:
                 if message.type != WSMsgType.TEXT:
                     continue

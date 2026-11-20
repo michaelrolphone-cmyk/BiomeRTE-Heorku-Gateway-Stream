@@ -81,6 +81,8 @@ class Coordinator:
         self.services = {}
         self.reserved_authorities = frozenset(reserved_authorities)
         self.checkpoint_head = checkpoint_head
+        # The authority transport supplies a pure local liveness observation.
+        self.preparation_connected = None
 
     def _manifest(self, value):
         if not isinstance(value, dict):
@@ -148,6 +150,11 @@ class Coordinator:
                         set(authority["resources"]) & set(other["resources"]) or
                         set(authority["providers"]) & set(other["providers"])):
                     raise ValueError("logical authority scope is already registered")
+        wait = (activation or {}).get("wait_for_external_fence", False)
+        if type(wait) is not bool:
+            raise ValueError("activation.wait_for_external_fence must be boolean")
+        if wait and not authority:
+            raise ValueError("external fence waiting requires a scoped logical authority")
         return value
 
     def _new_service(self, manifest, now):
@@ -198,9 +205,19 @@ class Coordinator:
             return "image_revision_mismatch"
         if candidate["healthy"] is False:
             return "service_unhealthy"
-        if grant and candidate["healthy"] is None and (
-                now - grant["started"] >= manifest.get("startup_grace_s", 20)):
-            return "startup_health_timeout"
+        if grant and candidate["healthy"] is None:
+            if self._verified_fence_wait(item, candidate, grant):
+                grant["external_fence_wait"] = True
+            else:
+                # A real fence ends the external wait. Activation still gets a
+                # bounded startup window; it cannot borrow an indefinite wait.
+                if (grant.get("external_fence_wait") and
+                        "activation_started" not in grant and
+                        self._fence_ready(item, candidate, grant)):
+                    grant["activation_started"] = now
+                started = grant.get("activation_started", grant["started"])
+                if now - started >= manifest.get("startup_grace_s", 20):
+                    return "startup_health_timeout"
         if candidate.get("released"):
             return "worker_released"
         return None
@@ -250,6 +267,31 @@ class Coordinator:
                 ack.get("boot_epoch") == self.boot_epoch and
                 ack.get("grant_token") == grant["grant_token"])
 
+    def _verified_fence_wait(self, item, candidate, grant):
+        """A live scoped recovery process may wait without creating new intent.
+
+        This is opt-in because registration must follow durable publication of
+        the physical fence intent. Readiness or a cached checkpoint alone is
+        insufficient. The transport callback must not call back into reconcile.
+        """
+        manifest = item["manifest"]
+        if (not manifest.get("activation", {}).get("wait_for_external_fence") or
+                not manifest.get("authority") or candidate is None or
+                candidate.get("healthy") is not None or
+                "activation_started" in grant or
+                not self._state_ready(item, candidate, grant) or
+                self._fence_ready(item, candidate, grant)):
+            return False
+        baseline = grant.get("prepared_checkpoint")
+        head = self.checkpoint_head(grant["service_id"]) if self.checkpoint_head else None
+        if (not baseline or not head or
+                head.get("boot_epoch") != self.boot_epoch or
+                not exact_binding(head.get("binding"), grant) or
+                head.get("sequence", -1) <= baseline["sequence"]):
+            return False
+        connected = self.preparation_connected
+        return connected is not None and connected(grant_binding(grant)) is True
+
     def _reconcile(self, service_id, item, now):
         manifest = item["manifest"]
         ttl = manifest.get("worker_ttl_s", 10)
@@ -285,7 +327,10 @@ class Coordinator:
                 return
             if (manifest["effect_policy"] == "externally_fenced" and
                     not self._fence_ready(item, candidate, grant)):
-                if now - grant["started"] >= manifest.get("startup_grace_s", 20):
+                if self._verified_fence_wait(item, candidate, grant):
+                    grant["external_fence_wait"] = True
+                    item["reason"] = "waiting_for_external_fence"
+                elif now - grant["started"] >= manifest.get("startup_grace_s", 20):
                     grant["draining"] = True
                     item["reason"] = "external_fence_timeout"
                 else:
