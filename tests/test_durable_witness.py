@@ -146,6 +146,14 @@ class DurableWitnessTests(unittest.IsolatedAsyncioTestCase):
             await self.witness.commit(packet(2, "c" * 64, "a" * 64))
         self.assertEqual("b" * 64, self.metadata.head["digest"])
 
+    async def test_explicit_lease_refusal_immediately_fences_cached_authority(self):
+        self.assertTrue(self.witness.current())
+        self.metadata.lease["boot_id"] = "replacement-witness"
+        with self.assertRaises(WitnessError):
+            await self.witness.refresh()
+        self.assertFalse(self.witness.current())
+        self.assertEqual(0, self.coordinator.witness_deadline())
+
     async def test_network_latency_never_extends_witness_authority(self):
         self.clock.advance(41)
         restarted = Coordinator("coordinator", max_lease_ttl_s=10, clock=self.clock)

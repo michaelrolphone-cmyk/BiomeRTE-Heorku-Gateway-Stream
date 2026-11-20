@@ -103,7 +103,12 @@ class DurableWitness:
         started = self.coordinator.clock()
         operation = "acquire" if acquiring else "renew"
         body = dict(boot_id=self.boot_id, max_grant_s=self.coordinator.max_lease_ttl_s) if acquiring else dict(owner=self.owner())
-        response = await self.request(operation, lease_s=self.lease_s, **body)
+        try:
+            response = await self.request(operation, lease_s=self.lease_s, **body)
+        except WitnessError as exc:
+            if exc.status == 409:
+                self.deadline = 0  # explicit epoch refusal overrides cached time
+            raise
         lease = response.get("lease")
         if (not isinstance(lease, dict) or lease.get("witness") != self.witness_id
                 or lease.get("boot_id") != self.boot_id or type(lease.get("epoch")) is not int
