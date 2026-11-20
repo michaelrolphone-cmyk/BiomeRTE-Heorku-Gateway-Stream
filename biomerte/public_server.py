@@ -80,7 +80,7 @@ def application(config):
             'authorities':sorted(secrets),
             'authority_inspection_links':sorted(authorities.links),'sessions':len(router.sessions),
             'service_authority_links':sorted(services.links),
-            'service_checkpoint_workers':sorted(checkpoints.links),
+            'service_checkpoint_workers':sorted({worker for worker, service in checkpoints.links}),
             'service_durable_witness_ready':durable.current() if durable else None,
             'service_durable_checkpoint_refs':len(durable.heads) if durable else None,
             'rover_bridge':ingress.link is not None,
