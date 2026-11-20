@@ -51,6 +51,10 @@ class ServiceAuthorities:
             raise ValueError("Positive authority heartbeat required")
         self.heartbeat = heartbeat
         coordinator.preparation_connected = self.preparation_connected
+        coordinator.authority_transport_status = self.timeout_status
+
+    def timeout_status(self):
+        return dict(registration_timeout_s=self.timeout, rpc_timeout_s=self.rpc_timeout)
 
     def preparation_connected(self, binding):
         """Observe this exact registered process without recursive admission.
