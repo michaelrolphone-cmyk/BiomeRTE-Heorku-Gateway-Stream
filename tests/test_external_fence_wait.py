@@ -300,6 +300,9 @@ class ExternalFenceWaitTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(200, response.status)
         value = await response.json()
         self.assertIn("verified_external_fence_wait", value["supported_features"])
+        self.assertIn("independent_authority_rpc_timeout", value["supported_features"])
+        self.assertEqual({"registration_timeout_s": .3, "rpc_timeout_s": .3},
+                         value["authority_transport"])
         self.assertEqual(self.spec, value["services"]["example"]["desired_manifest"])
         self.assertNotIn(self.binding["grant_token"], str(value))
 
