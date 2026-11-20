@@ -17,9 +17,12 @@ identify the initial cause of missing registration or prove hardware recovery.
 
 ## Opt-in contract
 
-An operator may add `"wait_for_external_fence": true` inside the existing
-`activation` object of a scoped logical authority manifest. The full manifest
-revision still changes and must pass the existing compare-and-set rollout.
+An operator may add the top-level field `"wait_for_external_fence": true`
+to a scoped logical authority manifest. Keep the existing `activation` object
+unchanged: the deployed adapter accepts exactly `protocol` and `binding`.
+The complete manifest revision still changes and must pass the existing
+compare-and-set rollout. The current runner preserves and hashes the top-level
+policy without requiring a runner image update.
 
 Enable this only for an adapter whose authority connects its recovery WebSocket
 **after** publishing a new, durable physical fence intent. BiomeRTE's scoped
@@ -82,7 +85,8 @@ after deployment before opting in a manifest; it does not configure or admit
 any service.
 
 No production manifest is changed by this branch. The candidate requires review,
-successful tests, source correspondence and an explicit manifest opt-in before
+successful tests, source correspondence, validation by each deployed runner and
+an explicit manifest opt-in before
 live use. Its expected benefit is to stop needless grant/intent churn while
 recovery traffic remains available; it does not repair a broken route or certify
 a physical provider's state.

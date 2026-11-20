@@ -150,9 +150,9 @@ class Coordinator:
                         set(authority["resources"]) & set(other["resources"]) or
                         set(authority["providers"]) & set(other["providers"])):
                     raise ValueError("logical authority scope is already registered")
-        wait = (activation or {}).get("wait_for_external_fence", False)
+        wait = value.get("wait_for_external_fence", False)
         if type(wait) is not bool:
-            raise ValueError("activation.wait_for_external_fence must be boolean")
+            raise ValueError("wait_for_external_fence must be boolean")
         if wait and not authority:
             raise ValueError("external fence waiting requires a scoped logical authority")
         return value
@@ -275,7 +275,7 @@ class Coordinator:
         insufficient. The transport callback must not call back into reconcile.
         """
         manifest = item["manifest"]
-        if (not manifest.get("activation", {}).get("wait_for_external_fence") or
+        if (not manifest.get("wait_for_external_fence") or
                 not manifest.get("authority") or candidate is None or
                 candidate.get("healthy") is not None or
                 "activation_started" in grant or

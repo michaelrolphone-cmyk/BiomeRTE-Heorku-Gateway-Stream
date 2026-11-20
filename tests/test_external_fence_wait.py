@@ -13,9 +13,8 @@ from test_service_coordinator import Clock, heartbeat
 
 
 def waiting_manifest(enabled=True, **changes):
-    activation = dict(protocol="biomerte-service-adapter/1",
-                      binding="test-authority", wait_for_external_fence=enabled)
-    return service_manifest(activation=activation, **changes)
+    activation = dict(protocol="biomerte-service-adapter/1", binding="test-authority")
+    return service_manifest(activation=activation, wait_for_external_fence=enabled, **changes)
 
 
 class ExternalFenceWaitTests(unittest.TestCase):
@@ -204,6 +203,13 @@ class ExternalFenceWaitTests(unittest.TestCase):
         self.assertEqual([], self.report(**ready)["assignments"])
         self.assertEqual("startup_health_timeout",
                          self.coordinator.status()["services"]["example"]["state"])
+
+    def test_opt_in_keeps_existing_adapter_shape_and_is_revision_bound(self):
+        self.assertEqual({"protocol", "binding"}, set(self.spec["activation"]))
+        self.assertIs(True, self.spec["wait_for_external_fence"])
+        original = copy.deepcopy(self.spec)
+        original.pop("wait_for_external_fence")
+        self.assertNotEqual(self.spec["revision"], manifest_revision(original))
 
     def test_wait_option_requires_boolean_and_scoped_authority(self):
         for value in ("true", 1, None):
