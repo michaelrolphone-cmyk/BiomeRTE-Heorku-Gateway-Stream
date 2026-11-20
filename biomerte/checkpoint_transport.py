@@ -156,13 +156,15 @@ class CheckpointWorkers:
                                 continue
                             expected_chunk = pending.get("chunk")
                             if pending["operation"] == "checkpoint.chunk.put":
-                                if (result.get("digest") != expected_chunk["digest"] or
+                                if (type(result.get("bytes")) is not int or
+                                        result.get("digest") != expected_chunk["digest"] or
                                         result.get("bytes") != expected_chunk["bytes"] or
                                         result.get("durable") is not True):
                                     continue
                             elif pending["operation"] == "checkpoint.chunk.get":
                                 actual_chunk = chunk_payload(result, data=True)
-                                if (actual_chunk["digest"] != expected_chunk["digest"] or
+                                if (type(result.get("bytes")) is not int or
+                                        actual_chunk["digest"] != expected_chunk["digest"] or
                                         result.get("bytes") != actual_chunk["bytes"]):
                                     continue
                             else:
