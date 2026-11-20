@@ -224,7 +224,8 @@ class ExternalFenceWaitTransportTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.clock = Clock()
         self.coordinator = Coordinator("secret", max_lease_ttl_s=10, clock=self.clock)
-        self.services = ServiceAuthorities(self.coordinator, "secret", timeout=.3, heartbeat=.04)
+        self.services = ServiceAuthorities(self.coordinator, "secret", timeout=.3,
+                                           rpc_timeout=.3, heartbeat=.04)
         self.helpers = CheckpointWorkers(self.coordinator, timeout=.3)
         self.spec = waiting_manifest()
         self.clock.advance(10)
