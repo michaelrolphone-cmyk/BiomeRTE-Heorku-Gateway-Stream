@@ -99,6 +99,23 @@ class ServiceTransportTests(unittest.IsolatedAsyncioTestCase):
         services = ServiceAuthorities(self.coordinator, SECRET)
         self.assertEqual(5, services.timeout)
         self.assertEqual(20, services.rpc_timeout)
+        self.assertEqual({"registration_timeout_s": 5, "rpc_timeout_s": 20},
+                         self.coordinator.status()["authority_transport"])
+
+    async def test_authenticated_status_reports_actual_authority_deadlines(self):
+        response = await self.client.get(self.base + "/api/service-coordinator/status")
+        self.assertEqual(401, response.status)
+        await response.read()
+        self.services.timeout = .2
+        self.services.rpc_timeout = .7
+        response = await self.client.get(self.base + "/api/service-coordinator/status",
+                                        headers=self.headers)
+        self.assertEqual(200, response.status)
+        value = await response.json()
+        self.assertIn("independent_authority_rpc_timeout", value["supported_features"])
+        self.assertEqual({"registration_timeout_s": .2, "rpc_timeout_s": .7},
+                         value["authority_transport"])
+        self.assertNotIn(self.binding["grant_token"], str(value))
 
     async def test_rpc_budget_requires_a_positive_finite_number(self):
         for value in (0, -1, True, "20", float("inf"), float("nan")):
