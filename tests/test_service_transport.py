@@ -69,7 +69,7 @@ class ServiceTransportTests(unittest.IsolatedAsyncioTestCase):
                                               headers=self.headers)
         self.addAsyncCleanup(socket.close)
         await socket.send_json(dict(type="register", worker_id=worker,
-                                    worker_incarnation=incarnation))
+                                    worker_incarnation=incarnation, service_id="example"))
         self.assertEqual("registered", (await socket.receive_json(timeout=1))["type"])
         return socket
 
@@ -311,6 +311,7 @@ class ServiceTransportTests(unittest.IsolatedAsyncioTestCase):
         await socket.send_json(dict(type="checkpoint_result", id=request["id"],
             worker_id=request["worker_id"], worker_incarnation=request["worker_incarnation"],
             boot_epoch=request["boot_epoch"], binding=request["binding"], status=200,
+            service_id=request["service_id"],
             checkpoint=checkpoint if checkpoint is not None else identity,
             result={"durable": durable}))
 
@@ -390,7 +391,7 @@ class ServiceTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn((await resumed.receive(timeout=1)).type, (WSMsgType.CLOSE, WSMsgType.CLOSED))
         await resumed.close()
         await helper.close()
-        self.assertEqual(("mac", "boot2"), self.helpers.links["mac"]["key"])
+        self.assertEqual(("mac", "boot2"), self.helpers.links[("mac", "example")]["key"])
         self.assertFalse(new.closed)
 
     async def test_checkpoint_rejects_late_reply_after_owner_expiry(self):
@@ -410,7 +411,7 @@ class ServiceTransportTests(unittest.IsolatedAsyncioTestCase):
         await socket.send_json(dict(type="checkpoint_result", id=request["id"],
             worker_id=request["worker_id"], worker_incarnation=request["worker_incarnation"],
             boot_epoch=request["boot_epoch"], binding=request["binding"], status=200,
-            checkpoint=None, result=result))
+            service_id=request["service_id"], checkpoint=None, result=result))
 
     async def test_chunk_put_requires_exact_durable_ack_without_recording_a_head(self):
         helper = await self.helper_socket()

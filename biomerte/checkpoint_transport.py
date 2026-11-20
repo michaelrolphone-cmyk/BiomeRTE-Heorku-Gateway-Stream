@@ -1,4 +1,4 @@
-"""In-flight checkpoint relay to independent per-worker Docker helpers.
+"""In-flight checkpoint relay to independent per-service, per-worker helpers.
 
 The gateway holds no checkpoint journal or authoritative freshness claim.
 Helpers authenticate the package, retain high water locally, and fsync before
@@ -100,8 +100,53 @@ class CheckpointWorkers:
             raise web.HTTPConflict(text="Checkpoint is older than or conflicts with current high water")
 
     def _current(self, key, link, service_id=None):
-        return (self.links.get(key[0]) is link and not link["socket"].closed and
-                self.coordinator.worker_current(*key, service_id=service_id))
+        scope = link["service_id"]
+        return ((service_id is None or service_id == scope) and
+                self.links.get((key[0], scope)) is link and not link["socket"].closed and
+                link["boot_epoch"] == self.coordinator.boot_epoch and
+                self.coordinator.worker_current(*key, service_id=scope))
+
+    async def _registration(self, socket, worker_id):
+        """Bind a socket once. Legacy helpers prove their own nonempty scope."""
+        value = await socket.receive_json()
+        if not isinstance(value, dict) or value.get("type") != "register":
+            raise ValueError("Worker registration required")
+        key = worker_identity({k: value.get(k) for k in ("worker_id", "worker_incarnation")})
+        if key[0] != worker_id or not self.coordinator.worker_current(*key):
+            raise ValueError("Current supervisor incarnation required")
+        epoch = self.coordinator.boot_epoch
+        legacy = "service_id" not in value
+        if legacy:
+            # The deployed v1 helper reads requests before its registration ACK.
+            # This probe is read only and stays on this exact authenticated
+            # socket; no ordinary pending RPC can satisfy it or infer a scope.
+            identity = uuid.uuid4().hex
+            await socket.send_json(dict(type="checkpoint.status", id=identity,
+                worker_id=key[0], worker_incarnation=key[1], boot_epoch=epoch,
+                binding=None, checkpoint=None))
+            reply = await socket.receive_json()
+            if (not isinstance(reply, dict) or reply.get("type") != "checkpoint_result" or
+                    reply.get("id") != identity or reply.get("worker_id") != key[0] or
+                    reply.get("worker_incarnation") != key[1] or
+                    reply.get("boot_epoch") != epoch or "binding" not in reply or
+                    reply["binding"] is not None or type(reply.get("status")) is not int or
+                    reply["status"] != 200 or not isinstance(reply.get("result"), dict) or
+                    reply["result"].get("durable") is not True):
+                raise ValueError("Exact durable legacy helper scope proof required")
+            checkpoint = reply.get("checkpoint")
+            service_id = checkpoint.get("service_id") if isinstance(checkpoint, dict) else None
+            checkpoint_identity(checkpoint, service_id)
+            if "service_id" in reply and reply["service_id"] != service_id:
+                raise ValueError("Legacy helper scope proof disagrees")
+        else:
+            service_id = value["service_id"]
+        if (not isinstance(service_id, str) or not service_id or
+                service_id not in self.coordinator.services or
+                epoch != self.coordinator.boot_epoch or
+                not self.coordinator.worker_current(*key, service_id=service_id)):
+            raise ValueError("Current configured service supervisor required")
+        return dict(socket=socket, key=key, service_id=service_id,
+                    boot_epoch=epoch, legacy=legacy)
 
     async def connect(self, request):
         authorize_coordinator(request, self.coordinator)
@@ -110,25 +155,27 @@ class CheckpointWorkers:
         await socket.prepare(request)
         link = None
         try:
-            value = await socket.receive_json(timeout=self.timeout)
-            if not isinstance(value, dict) or value.get("type") != "register":
-                raise ValueError("Worker registration required")
-            key = worker_identity({k: value.get(k) for k in ("worker_id", "worker_incarnation")})
-            if key[0] != worker_id or not self.coordinator.worker_current(*key):
-                raise ValueError("Current supervisor incarnation required")
-            old = self.links.get(worker_id)
+            candidate = await asyncio.wait_for(
+                self._registration(socket, worker_id), self.timeout)
+            key, service_id = candidate["key"], candidate["service_id"]
+            slot = (worker_id, service_id)
+            # No await between the last liveness/epoch check and insertion.
+            if (candidate["boot_epoch"] != self.coordinator.boot_epoch or
+                    not self.coordinator.worker_current(*key, service_id=service_id)):
+                raise ValueError("Helper registration changed")
+            old = self.links.get(slot)
             if old and self._current(old["key"], old):
-                raise ValueError("Current helper already connected")
-            link = dict(socket=socket, key=key)
-            self.links[worker_id] = link
+                raise ValueError("Current helper already connected for this service")
+            link = candidate
+            self.links[slot] = link
             if old:
                 closing = asyncio.create_task(old["socket"].close(
                     code=1008, message=b"Worker incarnation superseded"))
                 self.closing.add(closing)
                 closing.add_done_callback(self.closing.discard)
             await socket.send_json(dict(type="registered", protocol=PROTOCOL,
-                worker_id=key[0], worker_incarnation=key[1],
-                boot_epoch=self.coordinator.boot_epoch))
+                worker_id=key[0], worker_incarnation=key[1], service_id=service_id,
+                boot_epoch=link["boot_epoch"]))
             async for message in socket:
                 if message.type != WSMsgType.TEXT:
                     continue
@@ -142,7 +189,10 @@ class CheckpointWorkers:
                             reply.get("worker_id") != key[0] or
                             reply.get("worker_incarnation") != key[1] or
                             reply.get("boot_epoch") != pending["boot_epoch"] or
-                            reply.get("binding") != pending["binding"] or
+                            "binding" not in reply or reply["binding"] != pending["binding"] or
+                            pending["service_id"] != service_id or
+                            (not link["legacy"] and reply.get("service_id") != service_id) or
+                            ("service_id" in reply and reply["service_id"] != service_id) or
                             type(reply.get("status")) is not int or
                             reply["status"] not in REPLY_STATUSES):
                         continue
@@ -158,6 +208,11 @@ class CheckpointWorkers:
                                  reply["result"].get("durable") is not True)):
                             continue
                         result = reply.get("result")
+                        if isinstance(result, dict) and "retained" in result:
+                            if not isinstance(result["retained"], list):
+                                continue
+                            for retained in result["retained"]:
+                                checkpoint_identity(retained, service_id)
                         if pending["operation"].startswith("checkpoint.chunk."):
                             if checkpoint is not None or not isinstance(result, dict):
                                 continue
@@ -185,8 +240,9 @@ class CheckpointWorkers:
             await socket.close(code=1008, message=b"Invalid checkpoint helper registration")
         finally:
             if link is not None:
-                if self.links.get(worker_id) is link:
-                    self.links.pop(worker_id, None)
+                slot = (worker_id, link["service_id"])
+                if self.links.get(slot) is link:
+                    self.links.pop(slot, None)
                 for pending in list(self.pending.values()):
                     if pending["link"] is link and not pending["future"].done():
                         pending["future"].set_exception(ConnectionError("Checkpoint helper disconnected"))
@@ -194,7 +250,7 @@ class CheckpointWorkers:
 
     async def rpc(self, worker, operation, service_id, *, binding=None, checkpoint=None, chunk=None, digests=None):
         key = worker_identity(worker)
-        link = self.links.get(key[0])
+        link = self.links.get((key[0], service_id))
         if not link or link["key"] != key or not self._current(key, link, service_id):
             raise web.HTTPServiceUnavailable(text="Current checkpoint helper unavailable")
         if len(self.pending) >= self.limit:

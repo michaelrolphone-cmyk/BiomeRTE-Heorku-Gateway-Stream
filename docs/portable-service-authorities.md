@@ -290,11 +290,35 @@ Each helper connects outward to
 `/service-worker/{worker_id}/connect`, using the coordinator Bearer credential:
 
 ```json
-{"type":"register","worker_id":"...","worker_incarnation":"..."}
+{"type":"register","worker_id":"...","worker_incarnation":"...","service_id":"..."}
 ```
 
-The incarnation must identify an unambiguous eligible current supervisor.
-Ownership is not required. Authenticated coordinator status exposes candidates
+The incarnation must identify an unambiguous eligible current supervisor for that
+exact service. Ownership is not required. A helper connection is indexed by
+(worker_id, service_id); separate relay and controller helpers on the same host
+coexist without synthetic worker IDs. A duplicate current connection for the
+same pair is rejected, and reconnect cleanup retires only that pair.
+
+The registration acknowledgement echoes service_id, worker identity and the
+gateway boot_epoch. New helpers wait for that exact acknowledgement before
+reporting connection readiness. Deploy the scoped gateway before new helpers.
+
+The deployed legacy relay helper omits service_id in registration. Within the
+same bounded registration deadline, the gateway sends a read-only
+checkpoint.status probe to that exact authenticated socket before acknowledging
+it. The legacy reply must match the fresh request ID, supervisor incarnation,
+gateway epoch and null binding, and supply status 200, durable true and a valid
+nonempty checkpoint reference. That reference binds the socket once to its
+service. Empty or inconsistent legacy stores are refused; there is no wildcard,
+host-only lookup, service-name default or fallback to a sibling helper. This
+compatibility probe does not publish a head or create a witness.
+
+Every ordinary RPC is selected by the exact service and worker, and its reply
+is correlated to that socket, service, incarnation, epoch and binding. New
+helpers echo service_id; legacy replies may omit it only on their already
+bound socket, and checkpoint/retained references must match that scope.
+Local adapter bindings and remote helper messages are also checked against the
+helper's configured service before store or block access. Authenticated coordinator status exposes candidates
 under `services[service_id].candidates`, including their worker ID, incarnation,
 readiness reason, and advertised checkpoint metadata.
 
@@ -309,7 +333,7 @@ Private checkpoint APIs are:
 A checkpoint is `{service_id, sequence, digest, package}`: sequence is a
 nonnegative integer, digest is 64 lowercase hex, and package is an opaque signed
 object. Worker/target identities contain exactly worker_id and worker_incarnation.
-Empty status workers selects current registered helpers. Empty replicate targets
+Empty status workers selects current registered helpers for that exact service. Empty replicate targets
 permits a degraded owner to publish its locally fsynced high water.
 
 Helper requests have `type: checkpoint.put|get|status`, a transport ID, current
@@ -325,6 +349,7 @@ A helper reply is:
   "id": "<same transport ID>",
   "worker_id": "...",
   "worker_incarnation": "...",
+  "service_id": "...",
   "boot_epoch": "<same gateway epoch>",
   "binding": "<same B, or null for get/status>",
   "status": 200,
