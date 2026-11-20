@@ -83,6 +83,7 @@ class Coordinator:
         self.checkpoint_head = checkpoint_head
         # The authority transport supplies a pure local liveness observation.
         self.preparation_connected = None
+        self.authority_transport_status = None
         self.witness_deadline = None
         self.publication_pending = None
 
@@ -541,8 +542,11 @@ class Coordinator:
         return dict(protocol=PROTOCOL, authority_mode="single_process",
             boot_epoch=self.boot_epoch, max_lease_ttl_s=self.max_lease_ttl_s,
             boot_grace_remaining_s=max(0, self.boot_until - now),
-            supported_features=["verified_external_fence_wait"] +
+            supported_features=["verified_external_fence_wait",
+                                "independent_authority_rpc_timeout"] +
                 (["durable_checkpoint_witness"] if self.witness_deadline else []),
+            authority_transport=(self.authority_transport_status()
+                                 if self.authority_transport_status else None),
             durable_witness_ready=(self.witness_deadline() > now if self.witness_deadline else None),
             services={sid: self._summary(sid, item, now)
                       for sid, item in self.services.items()})

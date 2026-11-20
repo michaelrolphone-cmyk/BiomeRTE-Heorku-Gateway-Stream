@@ -224,7 +224,8 @@ class ExternalFenceWaitTransportTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.clock = Clock()
         self.coordinator = Coordinator("secret", max_lease_ttl_s=10, clock=self.clock)
-        self.services = ServiceAuthorities(self.coordinator, "secret", timeout=.3, heartbeat=.04)
+        self.services = ServiceAuthorities(self.coordinator, "secret", timeout=.3,
+                                           rpc_timeout=.3, heartbeat=.04)
         self.helpers = CheckpointWorkers(self.coordinator, timeout=.3)
         self.spec = waiting_manifest()
         self.clock.advance(10)
@@ -299,6 +300,9 @@ class ExternalFenceWaitTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(200, response.status)
         value = await response.json()
         self.assertIn("verified_external_fence_wait", value["supported_features"])
+        self.assertIn("independent_authority_rpc_timeout", value["supported_features"])
+        self.assertEqual({"registration_timeout_s": .3, "rpc_timeout_s": .3},
+                         value["authority_transport"])
         self.assertEqual(self.spec, value["services"]["example"]["desired_manifest"])
         self.assertNotIn(self.binding["grant_token"], str(value))
 

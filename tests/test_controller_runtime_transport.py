@@ -101,7 +101,7 @@ class ControllerRuntimeRoutingTests(unittest.IsolatedAsyncioTestCase):
         heartbeat(self.coordinator, self.spec, "mac")
         self.head = None
         self.coordinator.checkpoint_head = lambda sid: self.head if sid == "runtime" else None
-        self.services = ServiceAuthorities(self.coordinator, SECRET, timeout=.3)
+        self.services = ServiceAuthorities(self.coordinator, SECRET, timeout=.3, rpc_timeout=.3)
         app = web.Application()
         self.coordinator.mount(app)
         self.services.mount(app)

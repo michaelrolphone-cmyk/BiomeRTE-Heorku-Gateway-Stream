@@ -128,10 +128,10 @@ or the service manifest.
 
 | Variable | Heroku | Sites |
 |---|---|---|
-| `DURABLE_WITNESS_SECRET` | A separately generated high-entropy credential, at least32 characters | The identical private credential |
+| `DURABLE_WITNESS_SECRET` | A separately generated high-entropy credential, at least 32 characters | The identical private credential |
 | `DURABLE_WITNESS_ORIGIN` | HTTPS origin of the existing Sites gateway | Not used |
 | `DURABLE_WITNESS_ID` | Optional; default `biomerte-services` | Same configured identity; default `biomerte-services` |
-| `DURABLE_WITNESS_LEASE_S` | Optional; default120; at least twice the maximum service grant interval, at most600 | The protocol validates the requested bound |
+| `DURABLE_WITNESS_LEASE_S` | Optional; default 120; at least twice the maximum service grant interval, at most 600 | The protocol validates the requested bound |
 
 The stream credential and durable-witness credential must be different.
 `WEB_CONCURRENCY=1` and one web dyno remain required for live stream sessions.
@@ -151,6 +151,42 @@ metadata retains the original all-replica initial-custody requirement. An
 unavailable D1 witness does not authorize an arbitrary local snapshot.
 
 The existing GitHub workflow validates coordinator, transport, controller-route
-and durable-witness regressions on Python3.12 using requirements.txt. It is a
+and durable-witness regressions on Python 3.12 using requirements.txt. It is a
 test workflow, not a Heroku deployment workflow. Production version and config
 changes still require the existing authenticated Heroku operational path.
+
+
+### Git-pinned witness deployment
+
+The optional repository file `durable-witness.json` pins the public witness
+origin, identity and lease interval before the coordinator is constructed. Its
+exact fields are `format`, `origin`, `witness_id` and `lease_s`, with format
+`biomerte-durable-witness-deployment/1`. The origin must be a canonical bare HTTPS
+origin, with no credentials, path, trailing slash, query or fragment; the lease
+must be finite and between 60 and 600 seconds. A present malformed file, unknown
+field, duplicate field or conflicting explicit origin, identity or lease setting
+stops startup. An absent file with no witness environment settings retains the
+legacy configuration.
+
+The file contains no secrets or host placement. With the file present, an
+explicit separate `DURABLE_WITNESS_SECRET` takes precedence. Otherwise the
+credential is derived from the existing service-admin bearer. The existing
+Heroku environment variable is `STREAM_ROUTER_SECRET`; `coordinator_key` derives
+its service-admin bearer using HMAC-SHA256 with message
+`b'biomerte/service-coordinator/v1'` and returns lowercase hexadecimal text.
+
+`biomerte.witness_deployment.derive_witness_secret(token, origin, witness_id)`
+accepts that exact 64-character bearer text as its ASCII HMAC key. Its message is
+the concatenation of `b'biomerte/durable-witness/deployment/v1 '`, the canonical
+origin in ASCII, `b' '`, and the witness identity in ASCII. It returns the
+lowercase HMAC-SHA256 hexadecimal digest. The parent stream credential is never
+sent to Sites. Derive and install the matching witness credential through the
+existing private operational path; never print it or commit it.
+
+Deploy the Sites endpoint and matching private witness credential before merging
+the enabling file into the companion's deployed branch. This ordering alone does
+not establish an initial checkpoint reference for an existing service. A new
+witness has no evidence that one surviving helper has the latest accepted state.
+Initial custody still requires the configured replicas or a separately verified
+quiesced migration from the old live authority. Do not manufacture an empty
+checkpoint, copy a stale helper head, or treat an unreachable peer as consent.
