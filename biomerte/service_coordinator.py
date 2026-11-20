@@ -84,6 +84,8 @@ class Coordinator:
         # The authority transport supplies a pure local liveness observation.
         self.preparation_connected = None
         self.authority_transport_status = None
+        self.witness_deadline = None
+        self.publication_pending = None
 
     def _manifest(self, value):
         if not isinstance(value, dict):
@@ -135,21 +137,37 @@ class Coordinator:
             if (not isinstance(identity, str) or not REVISION.fullmatch(identity) or
                     identity in self.reserved_authorities):
                 raise ValueError("logical authority must be distinct from native authorities")
+            kind = authority.get("kind", "resource")
+            if kind not in ("resource", "controller"):
+                raise ValueError("unsupported logical authority kind")
+            controller = kind == "controller"
             for name in ("resources", "providers"):
                 entries = authority.get(name)
-                if (not isinstance(entries, list) or not entries or
+                if (not isinstance(entries, list) or not controller and not entries or
                         any(not isinstance(entry, str) or not entry for entry in entries) or
                         len(set(entries)) != len(entries)):
                     raise ValueError("authority." + name + " must contain unique exact identities")
             if any(not REVISION.fullmatch(p) for p in authority["providers"]):
                 raise ValueError("authority.providers must contain actor IDs")
+            aliases = authority.get("controller_aliases", [])
+            if controller:
+                if (not isinstance(aliases, list) or not aliases or
+                        any(not isinstance(alias, str) or not REVISION.fullmatch(alias)
+                            or alias not in self.reserved_authorities for alias in aliases) or
+                        len(set(aliases)) != len(aliases)):
+                    raise ValueError("controller aliases must be unique registered native authorities")
+                if value.get("state_policy") != "externally_managed":
+                    raise ValueError("controller runtime requires externally managed durable state")
+            elif "controller_aliases" in authority:
+                raise ValueError("controller aliases require an explicit controller authority")
             for sid, item in self.services.items():
                 other = item["manifest"].get("authority")
                 if sid == value["id"] or other is None:
                     continue
                 if (identity == other["id"] or
                         set(authority["resources"]) & set(other["resources"]) or
-                        set(authority["providers"]) & set(other["providers"])):
+                        set(authority["providers"]) & set(other["providers"]) or
+                        set(aliases) & set(other.get("controller_aliases", []))):
                     raise ValueError("logical authority scope is already registered")
         wait = value.get("wait_for_external_fence", False)
         if type(wait) is not bool:
@@ -299,11 +317,20 @@ class Coordinator:
         item["candidates"] = {key: value for key, value in item["candidates"].items()
                               if now - value["seen"] < ttl}
         grant = item["grant"]
+        durable_limit = self.witness_deadline() if self.witness_deadline else None
+        if grant and durable_limit is not None:
+            grant["expires"] = min(grant["expires"], durable_limit)
         if grant and now >= grant["expires"]:
             old_candidate = item["candidates"].get(grant["worker_key"])
             if old_candidate:
                 old_candidate["released"] = True
             item["grant"] = grant = None
+        if durable_limit is not None and now >= durable_limit:
+            item["reason"] = "durable_witness_unavailable"
+            return
+        if grant is None and self.publication_pending and self.publication_pending(service_id):
+            item["reason"] = "checkpoint_publication_reconciliation"
+            return
         if item.get("conflicting_revisions"):
             if grant:
                 grant["draining"] = True
@@ -357,7 +384,8 @@ class Coordinator:
             manifest_revision=manifest["revision"], boot_epoch=self.boot_epoch,
             grant_token=secrets.token_urlsafe(32), worker_key=worker_key,
             worker_id=worker_key[0], worker_incarnation=worker_key[1],
-            started=now, expires=now + manifest.get("lease_ttl_s", 10),
+            started=now, expires=min(now + manifest.get("lease_ttl_s", 10), durable_limit)
+                if durable_limit is not None else now + manifest.get("lease_ttl_s", 10),
             draining=False)
         item["reason"] = ("awaiting_state_preparation" if manifest.get("activation") else
                           "awaiting_external_fence"
@@ -436,7 +464,9 @@ class Coordinator:
                 identity = dict(row, worker_id=worker, worker_incarnation=incarnation)
                 if (self._matches(grant, identity) and not grant["draining"] and
                         self._candidate_reason(item, candidate, now, grant) is None):
-                    grant["expires"] = now + manifest.get("lease_ttl_s", 10)
+                    limit = self.witness_deadline() if self.witness_deadline else None
+                    grant["expires"] = (min(now + manifest.get("lease_ttl_s", 10), limit)
+                        if limit is not None else now + manifest.get("lease_ttl_s", 10))
                     if self._fence_ready(item, candidate, grant):
                         grant["fence_ack"] = candidate.get("fence_ack") or grant.get("fence_ack")
                 self._reconcile(service_id, item, now)
@@ -513,9 +543,11 @@ class Coordinator:
             boot_epoch=self.boot_epoch, max_lease_ttl_s=self.max_lease_ttl_s,
             boot_grace_remaining_s=max(0, self.boot_until - now),
             supported_features=["verified_external_fence_wait",
-                                "independent_authority_rpc_timeout"],
+                                "independent_authority_rpc_timeout"] +
+                (["durable_checkpoint_witness"] if self.witness_deadline else []),
             authority_transport=(self.authority_transport_status()
                                  if self.authority_transport_status else None),
+            durable_witness_ready=(self.witness_deadline() > now if self.witness_deadline else None),
             services={sid: self._summary(sid, item, now)
                       for sid, item in self.services.items()})
 

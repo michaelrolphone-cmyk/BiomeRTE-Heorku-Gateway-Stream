@@ -1,0 +1,6 @@
+{
+  "format": "biomerte-durable-witness-deployment/1",
+  "origin": "https://biomerte-controller.cantikash.chatgpt.site",
+  "witness_id": "biomerte-services",
+  "lease_s": 120
+}

@@ -1,12 +1,13 @@
 """Heroku public ingress: native streams plus reverse Mac Rover transport."""
 import asyncio
-from aiohttp import web, WSMsgType
+from aiohttp import ClientSession, web, WSMsgType
 from .stream_router import Router, _inspect, service_routes
 from .rover_transport import Ingress
 from .authority_transport import Authorities
 from .service_coordinator import Coordinator
 from .service_transport import ServiceAuthorities
 from .checkpoint_transport import CheckpointWorkers
+from .durable_witness import DurableWitness
 
 
 class Socket:
@@ -43,7 +44,13 @@ def application(config):
         coordinator.configure(manifest)
     services = ServiceAuthorities(coordinator,
         config.get("service_authority_secret", next(iter(secrets.values()))))
-    checkpoints = CheckpointWorkers(coordinator)
+    durable = None
+    if config.get("durable_witness_origin") or config.get("durable_witness_secret"):
+        durable = DurableWitness(None, coordinator, config.get("durable_witness_origin", ""),
+            config.get("durable_witness_secret", ""),
+            witness_id=config.get("durable_witness_id", "biomerte-services"),
+            lease_s=config.get("durable_witness_lease_s", 120))
+    checkpoints = CheckpointWorkers(coordinator, durable_witness=durable)
     authorities = Authorities(secrets, services=services)
     loop=asyncio.get_running_loop()
     def validate(sid,node):
@@ -63,12 +70,19 @@ def application(config):
     if owner not in ('hosted','mac_bridge'):
         raise ValueError('Unknown native session owner')
     app = web.Application(client_max_size=0)
+    if durable:
+        async def start_witness(app):
+            durable.session = ClientSession()
+            durable.start()
+        app.on_startup.append(start_witness)
     async def health(request):
         return web.json_response({'state':'ready','protocol':'leased-stream-inspect-v1',
             'authorities':sorted(secrets),
             'authority_inspection_links':sorted(authorities.links),'sessions':len(router.sessions),
             'service_authority_links':sorted(services.links),
-            'service_checkpoint_workers':sorted(checkpoints.links),
+            'service_checkpoint_workers':sorted({worker for worker, service in checkpoints.links}),
+            'service_durable_witness_ready':durable.current() if durable else None,
+            'service_durable_checkpoint_refs':len(durable.heads) if durable else None,
             'rover_bridge':ingress.link is not None,
             'session_owner':owner,
             'telemetry_header_limit_bytes':None,'telemetry_packet_limit_bytes':None,
@@ -97,6 +111,10 @@ def application(config):
     authorities.mount(app)
     app.router.add_get('/{session:[a-f0-9]{32}}/{lane:[a-z_]+}', stream)
     async def close(app):
+        if durable:
+            await durable.close()
+            if durable.session:
+                await durable.session.close()
         await authorities.close()
         await services.close()
         await checkpoints.close()

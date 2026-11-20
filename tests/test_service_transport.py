@@ -1,4 +1,5 @@
 import asyncio
+import base64
 import copy
 import hashlib
 import hmac
@@ -68,7 +69,7 @@ class ServiceTransportTests(unittest.IsolatedAsyncioTestCase):
                                               headers=self.headers)
         self.addAsyncCleanup(socket.close)
         await socket.send_json(dict(type="register", worker_id=worker,
-                                    worker_incarnation=incarnation))
+                                    worker_incarnation=incarnation, service_id="example"))
         self.assertEqual("registered", (await socket.receive_json(timeout=1))["type"])
         return socket
 
@@ -310,6 +311,7 @@ class ServiceTransportTests(unittest.IsolatedAsyncioTestCase):
         await socket.send_json(dict(type="checkpoint_result", id=request["id"],
             worker_id=request["worker_id"], worker_incarnation=request["worker_incarnation"],
             boot_epoch=request["boot_epoch"], binding=request["binding"], status=200,
+            service_id=request["service_id"],
             checkpoint=checkpoint if checkpoint is not None else identity,
             result={"durable": durable}))
 
@@ -389,7 +391,7 @@ class ServiceTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn((await resumed.receive(timeout=1)).type, (WSMsgType.CLOSE, WSMsgType.CLOSED))
         await resumed.close()
         await helper.close()
-        self.assertEqual(("mac", "boot2"), self.helpers.links["mac"]["key"])
+        self.assertEqual(("mac", "boot2"), self.helpers.links[("mac", "example")]["key"])
         self.assertFalse(new.closed)
 
     async def test_checkpoint_rejects_late_reply_after_owner_expiry(self):
@@ -404,6 +406,94 @@ class ServiceTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(503, response.status)
         await response.read()
         self.assertIsNone(self.helpers.head("example"))
+
+    async def chunk_reply(self, socket, request, result):
+        await socket.send_json(dict(type="checkpoint_result", id=request["id"],
+            worker_id=request["worker_id"], worker_incarnation=request["worker_incarnation"],
+            boot_epoch=request["boot_epoch"], binding=request["binding"], status=200,
+            service_id=request["service_id"], checkpoint=None, result=result))
+
+    async def test_chunk_put_requires_exact_durable_ack_without_recording_a_head(self):
+        helper = await self.helper_socket()
+        raw = b"bounded fixture"
+        key = hashlib.sha256(raw).hexdigest()
+        body = dict(service_id="example", worker=dict(worker_id="mac", worker_incarnation="boot1"),
+            binding=self.binding, chunk=dict(digest=key, data=base64.b64encode(raw).decode()))
+        good = dict(digest=key, bytes=len(raw), durable=True)
+        for result in (dict(good, digest="f" * 64), dict(good, bytes=len(raw)+1),
+                       dict(good, durable=False), good):
+            task = asyncio.create_task(self.post("/api/service-checkpoints/chunk-put", body, True))
+            request = await helper.receive_json(timeout=1)
+            self.assertEqual("checkpoint.chunk.put", request["type"])
+            self.assertEqual(key, request["chunk"]["digest"])
+            await self.chunk_reply(helper, request, result)
+            response = await task
+            self.assertEqual(200 if result == good else 503, response.status)
+            await response.read()
+            self.assertIsNone(self.helpers.head("example"))
+            self.assertEqual({}, self.helpers.pending)
+
+    async def test_chunk_reads_reject_corrupt_bytes_or_unrequested_missing_digests(self):
+        helper = await self.helper_socket()
+        raw = b"expected"
+        key = hashlib.sha256(raw).hexdigest()
+        common = dict(service_id="example", worker=dict(worker_id="mac", worker_incarnation="boot1"),
+                      binding=self.binding)
+        task = asyncio.create_task(self.post("/api/service-checkpoints/chunk-get",
+            dict(common, chunk={"digest": key}), True))
+        request = await helper.receive_json(timeout=1)
+        await self.chunk_reply(helper, request, dict(digest=key, bytes=len(raw),
+            data=base64.b64encode(b"tampered").decode()))
+        response = await task
+        self.assertEqual(503, response.status)
+        await response.read()
+        task = asyncio.create_task(self.post("/api/service-checkpoints/chunk-missing",
+            dict(common, digests=[key]), True))
+        request = await helper.receive_json(timeout=1)
+        await self.chunk_reply(helper, request, {"missing": ["a" * 64]})
+        response = await task
+        self.assertEqual(503, response.status)
+        await response.read()
+
+    async def test_chunk_request_refuses_stale_grant_bad_digest_and_oversize(self):
+        raw = b"x"
+        body = dict(service_id="example", worker=dict(worker_id="mac", worker_incarnation="boot1"),
+            binding=dict(self.binding, grant_token="stale"), chunk=dict(
+                digest=hashlib.sha256(raw).hexdigest(), data=base64.b64encode(raw).decode()))
+        response = await self.post("/api/service-checkpoints/chunk-put", body, True)
+        self.assertEqual(409, response.status)
+        await response.read()
+        body["binding"] = self.binding
+        body["chunk"]["digest"] = "a" * 64
+        response = await self.post("/api/service-checkpoints/chunk-put", body, True)
+        self.assertEqual(400, response.status)
+        await response.read()
+        raw = b"x" * (256 * 1024 + 1)
+        body["chunk"] = dict(digest=hashlib.sha256(raw).hexdigest(),
+                             data=base64.b64encode(raw).decode())
+        response = await self.post("/api/service-checkpoints/chunk-put", body, True)
+        self.assertEqual(400, response.status)
+        await response.read()
+        self.assertEqual({}, self.helpers.pending)
+
+    async def test_root_gc_notification_follows_witness_publication(self):
+        helper = await self.helper_socket()
+        checkpoint = self.checkpoint()
+        checkpoint["package"]["payload"] = {"state": {"format": "biomerte-controller-state/1"}}
+        body = self.replicate(checkpoint, [dict(worker_id="mac", worker_incarnation="boot1")])
+        task = asyncio.create_task(self.post("/api/service-checkpoints/replicate", body, True))
+        request = await helper.receive_json(timeout=1)
+        self.assertIsNone(self.helpers.head("example"))
+        await self.helper_reply(helper, request)
+        published = await helper.receive_json(timeout=1)
+        self.assertEqual("checkpoint.published", published["type"])
+        self.assertEqual(checkpoint["digest"], self.helpers.head("example")["digest"])
+        await self.helper_reply(helper, published)
+        response = await task
+        self.assertEqual(200, response.status)
+        await response.read()
+        self.assertNotIn("package", self.helpers.head("example"))
+
 
 
 if __name__ == "__main__":

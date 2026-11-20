@@ -10,6 +10,40 @@ from test_router_integration import grant,token,NODE,SECRET
 
 class PublicServerTests(unittest.IsolatedAsyncioTestCase):
 
+
+ async def test_checkpoint_health_keeps_distinct_physical_worker_ids_for_multiple_services(self):
+  from biomerte.service_coordinator import coordinator_key
+  from test_service_activation import service_manifest
+  runner=web.AppRunner(application({'secrets':{NODE:SECRET},'inspect_url':'https://gateway/inspect'}))
+  await runner.setup();self.addAsyncCleanup(runner.cleanup)
+  site=web.TCPSite(runner,'127.0.0.1',0);await site.start()
+  base='http://127.0.0.1:'+str(site._server.sockets[0].getsockname()[1])
+  headers={'Authorization':'Bearer '+coordinator_key(SECRET)}
+  specs=[service_manifest(id='relay'),service_manifest(id='controller',
+      authority={'id':'f'*64,'resources':['different.resource'],'providers':['c'*64]})]
+  async with ClientSession() as client:
+   rows=[dict(manifest=spec,manifest_revision=spec['revision'],platform='linux/arm64',
+       image_ref=spec['images']['linux/arm64'],prepared=True,dependencies_ready=True,healthy=None)
+       for spec in specs]
+   async with client.post(base+'/api/service-coordinator/heartbeat',headers=headers,
+       json=dict(worker_id='mac',worker_incarnation='boot1',services=rows)) as response:
+    self.assertEqual(200,response.status)
+    self.assertEqual({},(await response.json())['errors'])
+   sockets=[]
+   try:
+    for service in ('relay','controller'):
+     socket=await client.ws_connect(base+'/service-worker/mac/connect',headers=headers)
+     sockets.append(socket)
+     await socket.send_json(dict(type='register',service_id=service,
+         worker_id='mac',worker_incarnation='boot1'))
+     ack=await socket.receive_json(timeout=1)
+     self.assertEqual(('registered',service),(ack['type'],ack['service_id']))
+    async with client.get(base+'/health') as response:
+     self.assertEqual(200,response.status)
+     self.assertEqual(['mac'],(await response.json())['service_checkpoint_workers'])
+   finally:
+    await asyncio.gather(*(socket.close() for socket in sockets))
+
  async def test_service_coordinator_routes_precede_rover_api_fallback(self):
   from biomerte.service_coordinator import coordinator_key
   runner=web.AppRunner(application({'secrets':{NODE:SECRET},'inspect_url':'https://gateway/inspect'}))

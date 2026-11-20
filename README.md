@@ -102,7 +102,7 @@ service on either controller. Logical authority connections are bound to the
 exact current placement; stateful authorities must publish a verified checkpoint
 baseline and establish their external fence before effects are admitted.
 Independent per-host helpers retain and transfer checkpoints while the gateway
-keeps only current placement and high-water metadata in memory.
+keeps current placement in memory. When the durable witness is configured below, only its current epoch lease and the latest checkpoint reference for each service survive a dyno restart; checkpoint payloads remain on the hosts.
 
 [Portable service authorities](docs/portable-service-authorities.md) describes
 the manifest, preparation and effect gates, outbound authority/helper protocols,
@@ -110,3 +110,83 @@ checkpoint publication, native stream-router integration, and Rover routing.
 Existing native authorities remain supported. New Rover work resolves declared
 logical scopes through the witness; unrelated native resources keep their native
 availability. Existing lease, session, and pending command origins stay pinned.
+
+## Durable controller recovery across dyno restarts
+
+A signed local checkpoint proves its bytes, but does not prove that an absent
+replica has no newer accepted state. Configure the bounded durable witness when
+a surviving controller must recover after a dyno restart while its peer is down.
+
+The Sites gateway exposes authenticated HTTPS POST
+`/internal/service-witness/v1` through `durableWitness(request, env)`. Its D1
+database stores one current witness lease and one latest sequence/digest/scope
+per service. It stores no checkpoint payloads and no execution history.
+
+Set these runtime variables through the existing authenticated deployment
+configuration path. Never put their secret values in Git, images, command logs,
+or the service manifest.
+
+| Variable | Heroku | Sites |
+|---|---|---|
+| `DURABLE_WITNESS_SECRET` | A separately generated high-entropy credential, at least 32 characters | The identical private credential |
+| `DURABLE_WITNESS_ORIGIN` | HTTPS origin of the existing Sites gateway | Not used |
+| `DURABLE_WITNESS_ID` | Optional; default `biomerte-services` | Same configured identity; default `biomerte-services` |
+| `DURABLE_WITNESS_LEASE_S` | Optional; default 120; at least twice the maximum service grant interval, at most 600 | The protocol validates the requested bound |
+
+The stream credential and durable-witness credential must be different.
+`WEB_CONCURRENCY=1` and one web dyno remain required for live stream sessions.
+The durable epoch lease additionally prevents two coordinator processes from
+issuing overlapping service grants.
+
+Publication requires the exact host acknowledgements followed by durable
+latest-reference compare-and-swap before an effect-bearing response. Grants are
+capped by the durable lease. A new epoch waits for the prior lease to expire and
+applies the maximum service-grant quarantine. It loads the persisted exact head;
+a surviving host must verify that reference and every block before recovery.
+An unknown CAS outcome blocks replacement ownership until the exact write is
+reconciled or a newer epoch fences all delayed old writes.
+
+Do not delete witness rows to reset a rollout. Missing durable reference
+metadata retains the original all-replica initial-custody requirement. An
+unavailable D1 witness does not authorize an arbitrary local snapshot.
+
+The existing GitHub workflow validates coordinator, transport, controller-route
+and durable-witness regressions on Python 3.12 using requirements.txt. It is a
+test workflow, not a Heroku deployment workflow. Production version and config
+changes still require the existing authenticated Heroku operational path.
+
+
+### Git-pinned witness deployment
+
+The optional repository file `durable-witness.json` pins the public witness
+origin, identity and lease interval before the coordinator is constructed. Its
+exact fields are `format`, `origin`, `witness_id` and `lease_s`, with format
+`biomerte-durable-witness-deployment/1`. The origin must be a canonical bare HTTPS
+origin, with no credentials, path, trailing slash, query or fragment; the lease
+must be finite and between 60 and 600 seconds. A present malformed file, unknown
+field, duplicate field or conflicting explicit origin, identity or lease setting
+stops startup. An absent file with no witness environment settings retains the
+legacy configuration.
+
+The file contains no secrets or host placement. With the file present, an
+explicit separate `DURABLE_WITNESS_SECRET` takes precedence. Otherwise the
+credential is derived from the existing service-admin bearer. The existing
+Heroku environment variable is `STREAM_ROUTER_SECRET`; `coordinator_key` derives
+its service-admin bearer using HMAC-SHA256 with message
+`b'biomerte/service-coordinator/v1'` and returns lowercase hexadecimal text.
+
+`biomerte.witness_deployment.derive_witness_secret(token, origin, witness_id)`
+accepts that exact 64-character bearer text as its ASCII HMAC key. Its message is
+the concatenation of `b'biomerte/durable-witness/deployment/v1 '`, the canonical
+origin in ASCII, `b' '`, and the witness identity in ASCII. It returns the
+lowercase HMAC-SHA256 hexadecimal digest. The parent stream credential is never
+sent to Sites. Derive and install the matching witness credential through the
+existing private operational path; never print it or commit it.
+
+Deploy the Sites endpoint and matching private witness credential before merging
+the enabling file into the companion's deployed branch. This ordering alone does
+not establish an initial checkpoint reference for an existing service. A new
+witness has no evidence that one surviving helper has the latest accepted state.
+Initial custody still requires the configured replicas or a separately verified
+quiesced migration from the old live authority. Do not manufacture an empty
+checkpoint, copy a stale helper head, or treat an unreachable peer as consent.

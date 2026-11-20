@@ -2,16 +2,26 @@ name: Verify external fence wait
 
 on:
   push:
-    branches: [codex/verified-external-fence-wait-20261120]
+    branches: [codex/verified-external-fence-wait-20261120, fo/controller-checkpoint-chunks-20261120]
   pull_request:
     paths:
       - biomerte/service_coordinator.py
       - biomerte/service_transport.py
       - biomerte/checkpoint_transport.py
+      - biomerte/durable_witness.py
+      - biomerte/witness_deployment.py
+      - durable-witness.json
+      - biomerte/public_server.py
+      - biomerte/heroku_stream_router.py
       - tests/test_external_fence_wait.py
       - tests/test_service_activation.py
       - tests/test_service_coordinator.py
       - tests/test_service_transport.py
+      - tests/test_checkpoint_service_scope.py
+      - tests/test_public_server.py
+      - tests/test_durable_witness.py
+      - tests/test_witness_deployment.py
+      - tests/test_controller_runtime_transport.py
       - .github/workflows/external-fence-wait.yml
 
 permissions:
@@ -31,4 +41,4 @@ jobs:
       - name: Verify waiting, activation, coordinator and transport
         env:
           PYTHONPATH: tests
-        run: python -m unittest -v test_external_fence_wait test_service_activation test_service_coordinator test_service_transport
+        run: python -m unittest -v test_external_fence_wait test_service_activation test_service_coordinator test_service_transport test_checkpoint_service_scope test_public_server test_durable_witness test_witness_deployment test_controller_runtime_transport
