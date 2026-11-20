@@ -207,7 +207,9 @@ class ControllerRuntimeRoutingTests(unittest.IsolatedAsyncioTestCase):
                     "params": {"name": "lease.available"}, "owner": "signed-owner", "grant": "signed-grant"}),
                 ("gateway.events.grok", {"controller": MAC, "action": "list",
                     "args": {}, "owner": "signed-owner", "grant": "signed-grant"})):
-            await self.forwarded(socket, self.envelope(PI, operation, **arguments))
+            envelope = self.envelope(PI, operation)
+            envelope["arguments"] = arguments
+            await self.forwarded(socket, envelope)
             response = await self.post(self.call_path, arguments)
             self.assertEqual(400, response.status)
             await response.read()
