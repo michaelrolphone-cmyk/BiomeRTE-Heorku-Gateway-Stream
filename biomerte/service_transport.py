@@ -33,7 +33,8 @@ def authorize_coordinator(request, coordinator):
 
 
 class ServiceAuthorities:
-    def __init__(self, coordinator, secret, *, limit=64, timeout=5, heartbeat=15):
+    def __init__(self, coordinator, secret, *, limit=64, timeout=5, rpc_timeout=20,
+                 heartbeat=15):
         self.coordinator = coordinator
         self.secret = secret
         self.links = {}
@@ -41,6 +42,10 @@ class ServiceAuthorities:
         self.closing = set()
         self.limit = limit
         self.timeout = timeout
+        if (type(rpc_timeout) not in (int, float) or not math.isfinite(rpc_timeout)
+                or rpc_timeout <= 0):
+            raise ValueError("Positive authority RPC timeout required")
+        self.rpc_timeout = rpc_timeout
         if (type(heartbeat) not in (int, float) or not math.isfinite(heartbeat)
                 or heartbeat <= 0):
             raise ValueError("Positive authority heartbeat required")
@@ -171,7 +176,7 @@ class ServiceAuthorities:
         try:
             await link["socket"].send_json(dict(payload, id=identity,
                 binding=link["binding"], preparation=preparation))
-            value = await asyncio.wait_for(future, self.timeout)
+            value = await asyncio.wait_for(future, self.rpc_timeout)
             if not self._admitted(service_id, link, preparation):
                 raise web.HTTPServiceUnavailable(text="Service placement changed during request")
             return value
