@@ -67,7 +67,8 @@ class Authorities:
         return socket
 
     async def inspect(self, authority, session):
-        if self.services is not None and self.services.scope(authority=authority):
+        if self.services is not None and (self.services.scope(authority=authority)
+                                          or self.services.scope(controller=authority)):
             return await self.services.inspect(authority, session)
         socket = self.links.get(authority)
         if socket is None or socket.closed:

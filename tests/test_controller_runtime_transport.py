@@ -1,10 +1,15 @@
 """Grant-fenced routing for a replicated whole-site controller authority."""
 import asyncio
 import copy
+import hashlib
+import hmac
+import json
+import time
 import unittest
 
 from aiohttp import ClientSession, WSMsgType, web
 
+from biomerte.authority_transport import Authorities, authority_key
 from biomerte.service_coordinator import Coordinator, grant_binding, manifest_revision
 from biomerte.service_transport import ServiceAuthorities
 from test_service_coordinator import Clock, heartbeat
@@ -102,13 +107,17 @@ class ControllerRuntimeRoutingTests(unittest.IsolatedAsyncioTestCase):
         self.head = None
         self.coordinator.checkpoint_head = lambda sid: self.head if sid == "runtime" else None
         self.services = ServiceAuthorities(self.coordinator, SECRET, timeout=.3)
+        self.native = Authorities({PI: "legacy-pi-secret", MAC: "legacy-mac-secret"},
+                                  timeout=.3, services=self.services)
         app = web.Application()
         self.coordinator.mount(app)
         self.services.mount(app)
+        self.native.mount(app)
         self.runner = web.AppRunner(app)
         await self.runner.setup()
         self.addAsyncCleanup(self.runner.cleanup)
         self.addAsyncCleanup(self.services.close)
+        self.addAsyncCleanup(self.native.close)
         site = web.TCPSite(self.runner, "127.0.0.1", 0)
         await site.start()
         self.base = "http://127.0.0.1:" + str(site._server.sockets[0].getsockname()[1])
@@ -189,6 +198,19 @@ class ControllerRuntimeRoutingTests(unittest.IsolatedAsyncioTestCase):
                 ("cap.acquire", {"contract": "workspace.exec:1", "resource": "new.dynamic.resource", "task": "t"}),
                 ("provider.poll", {"provider": ACTOR})):
             await self.forwarded(socket, self.envelope(None, operation, **arguments))
+
+    async def test_event_owner_and_grant_travel_only_inside_original_signed_envelope(self):
+        socket = await self.socket()
+        self.active()
+        for operation, arguments in (
+                ("gateway.events.change", {"controller": PI, "method": "events/subscribe",
+                    "params": {"name": "lease.available"}, "owner": "signed-owner", "grant": "signed-grant"}),
+                ("gateway.events.grok", {"controller": MAC, "action": "list",
+                    "args": {}, "owner": "signed-owner", "grant": "signed-grant"})):
+            await self.forwarded(socket, self.envelope(PI, operation, **arguments))
+            response = await self.post(self.call_path, arguments)
+            self.assertEqual(400, response.status)
+            await response.read()
 
     async def test_ordered_original_request_identity_is_preserved(self):
         socket = await self.socket()
@@ -309,6 +331,39 @@ class ControllerRuntimeRoutingTests(unittest.IsolatedAsyncioTestCase):
         response = await pending
         self.assertEqual(503, response.status)
         await response.read()
+
+    async def test_legacy_stream_alias_uses_runtime_and_original_native_hmac(self):
+        socket = await self.socket()
+        self.active()
+        native_socket = await self.client.ws_connect(self.base + "/authority/" + PI + "/connect",
+            headers={"Authorization": "Authority " + authority_key("legacy-pi-secret", PI)})
+        self.addAsyncCleanup(native_socket.close)
+        session = "a" * 32
+        raw = json.dumps({"authority": PI, "session": session, "timestamp": int(time.time())}).encode()
+        signature = hmac.new(b"legacy-pi-secret", raw, hashlib.sha256).hexdigest()
+        pending = asyncio.create_task(self.client.post(self.base + "/stream/inspect", data=raw,
+            headers={"Authorization": "Router " + signature}))
+        request = await socket.receive_json(timeout=1)
+        self.assertEqual("inspect", request["type"])
+        self.assertEqual(PI, request["authority"])
+        # Logical identity is not a substitute for an old alias-bound grant.
+        await socket.send_json(dict(type="inspect_result", id=request["id"],
+            binding=request["binding"], status=200,
+            grant={"authority": LOGICAL, "id": session, "state": "open"}))
+        grant = {"authority": PI, "id": session, "state": "open"}
+        await socket.send_json(dict(type="inspect_result", id=request["id"],
+            binding=request["binding"], status=200, grant=grant))
+        response = await pending
+        self.assertEqual(200, response.status)
+        self.assertEqual(grant, await response.json())
+        await socket.close()
+        response = await self.client.post(self.base + "/stream/inspect", data=raw,
+            headers={"Authorization": "Router " + signature})
+        self.assertEqual(503, response.status)
+        await response.read()
+        # A live old native socket cannot become a fallback for managed state.
+        with self.assertRaises(asyncio.TimeoutError):
+            await asyncio.wait_for(native_socket.receive(), .05)
 
     async def test_browser_origin_is_rejected_on_runtime_and_pairing_routes(self):
         for path, payload in ((self.call_path, self.envelope()),
