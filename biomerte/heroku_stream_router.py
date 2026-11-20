@@ -18,12 +18,21 @@ def build_config(environ=None):
         nodes = [configured]
     if not nodes or any(len(n)!=64 or any(c not in '0123456789abcdef' for c in n) for n in nodes):
         raise ValueError('Expected controller authority fingerprints')
-    return {'listen':'0.0.0.0', 'port':int(env.get('PORT','8751')),
+    witness = {}
+    if env.get('DURABLE_WITNESS_ORIGIN') or env.get('DURABLE_WITNESS_SECRET'):
+        witness_secret = env.get('DURABLE_WITNESS_SECRET', '')
+        if len(witness_secret) < 32 or witness_secret == secret or not env.get('DURABLE_WITNESS_ORIGIN'):
+            raise ValueError('Durable witness requires its HTTPS origin and a separate credential')
+        witness = dict(durable_witness_origin=env['DURABLE_WITNESS_ORIGIN'],
+            durable_witness_secret=witness_secret,
+            durable_witness_id=env.get('DURABLE_WITNESS_ID', 'biomerte-services'),
+            durable_witness_lease_s=float(env.get('DURABLE_WITNESS_LEASE_S', '120')))
+    return dict(witness, **{'listen':'0.0.0.0', 'port':int(env.get('PORT','8751')),
         'secrets':{node:secret for node in nodes},
         'service_manifests':deployment.get('service_manifests', []),
         'rover_authority':deployment.get('rover_authority'),
         'router_owner':env.get('STREAM_ROUTER_OWNER') or deployment.get('router_owner','hosted'),
-        'inspect_url':env.get('STREAM_INSPECT_URL') or deployment['inspect_url']}
+        'inspect_url':env.get('STREAM_INSPECT_URL') or deployment['inspect_url']})
 
 def main():
     try:

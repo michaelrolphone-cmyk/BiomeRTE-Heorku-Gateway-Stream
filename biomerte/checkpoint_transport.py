@@ -14,6 +14,7 @@ import uuid
 from aiohttp import web, WSMsgType
 
 from .service_transport import authorize_coordinator, REPLY_STATUSES
+from .durable_witness import WitnessError
 
 
 PROTOCOL = "biomerte-service-checkpoint/1"
@@ -68,8 +69,9 @@ def worker_identity(value):
 
 
 class CheckpointWorkers:
-    def __init__(self, coordinator, *, limit=64, timeout=10):
+    def __init__(self, coordinator, *, limit=64, timeout=10, durable_witness=None):
         self.coordinator = coordinator
+        self.durable_witness = durable_witness
         self.links = {}
         self.pending = {}
         self.closing = set()
@@ -83,7 +85,12 @@ class CheckpointWorkers:
         if self.head_epoch != self.coordinator.boot_epoch:
             self.heads.clear()
             self.head_epoch = self.coordinator.boot_epoch
-        return self.heads.get(service_id)
+        value = self.heads.get(service_id)
+        anchor = self.durable_witness.head(service_id) if self.durable_witness else None
+        if anchor and (value is None or anchor["sequence"] > value["sequence"] or
+                       anchor["digest"] != value["digest"]):
+            return anchor
+        return value
 
     def _check_head(self, identity):
         previous = self.head(identity["service_id"])
@@ -252,6 +259,13 @@ class CheckpointWorkers:
                         return web.json_response({"error": "Replica rejected checkpoint"},
                                                  status=reply["status"])
                     acknowledgements.append(dict(target, checkpoint=identity, durable=True))
+                if self.durable_witness:
+                    try:
+                        await self.durable_witness.commit(checkpoint["package"])
+                    except (WitnessError, asyncio.TimeoutError, OSError):
+                        raise web.HTTPServiceUnavailable(text="Durable checkpoint witness unavailable")
+                    if not self.coordinator.validate_preparation(binding)["valid"]:
+                        raise web.HTTPConflict(text="Checkpoint grant changed during durable publication")
                 self.heads[service_id] = dict(identity, binding=dict(binding),
                                               boot_epoch=self.coordinator.boot_epoch)
                 if checkpoint["package"].get("payload", {}).get("state", {}).get("format") == "biomerte-controller-state/1":
