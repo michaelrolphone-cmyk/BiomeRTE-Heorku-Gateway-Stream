@@ -31,7 +31,7 @@ class ServiceTransportTests(unittest.IsolatedAsyncioTestCase):
         self.grant = heartbeat(self.coordinator, self.spec, "pi")["assignments"][0]
         self.binding = grant_binding(self.grant)
         heartbeat(self.coordinator, self.spec, "mac")
-        self.services = ServiceAuthorities(self.coordinator, SECRET, timeout=.3)
+        self.services = ServiceAuthorities(self.coordinator, SECRET, timeout=.3, rpc_timeout=.3)
         self.helpers = CheckpointWorkers(self.coordinator, timeout=.3)
         self.authorities = Authorities({NATIVE: SECRET}, services=self.services)
         app = web.Application()
@@ -94,6 +94,64 @@ class ServiceTransportTests(unittest.IsolatedAsyncioTestCase):
     async def reply(self, socket, request, result=None):
         await socket.send_json(dict(type=request["type"] + "_result", id=request["id"],
             binding=request["binding"], status=200, result=result or {"id": "lease"}))
+
+    async def test_default_rpc_budget_is_separate_from_registration(self):
+        services = ServiceAuthorities(self.coordinator, SECRET)
+        self.assertEqual(5, services.timeout)
+        self.assertEqual(20, services.rpc_timeout)
+
+    async def test_rpc_budget_requires_a_positive_finite_number(self):
+        for value in (0, -1, True, "20", float("inf"), float("nan")):
+            with self.subTest(value=value):
+                with self.assertRaisesRegex(ValueError, "authority RPC timeout"):
+                    ServiceAuthorities(self.coordinator, SECRET, rpc_timeout=value)
+
+    async def test_native_reply_can_outlast_registration_deadline(self):
+        socket = await self.authority_socket()
+        self.services.timeout = .03
+        self.services.rpc_timeout = .5
+        envelope = self.envelope("provider.poll", provider=True)
+        task = asyncio.create_task(self.post("/api/service-authorities/call", envelope))
+        request = await socket.receive_json(timeout=1)
+        self.assertEqual(envelope, request["envelope"])
+        await asyncio.sleep(.06)
+        await socket.send_json(dict(type="call_result", id=request["id"],
+            binding=request["binding"], status=400, error="Invalid native signature"))
+        response = await task
+        self.assertEqual(400, response.status)
+        self.assertEqual({"error": "Invalid native signature"}, await response.json())
+        self.assertEqual({}, self.services.pending)
+
+    async def test_rpc_expiry_cleans_pending_and_ignores_late_reply(self):
+        socket = await self.authority_socket()
+        self.services.rpc_timeout = .03
+        envelope = self.envelope("provider.poll", provider=True)
+        task = asyncio.create_task(self.post("/api/service-authorities/call", envelope))
+        request = await socket.receive_json(timeout=1)
+        response = await task
+        self.assertEqual(503, response.status)
+        self.assertEqual("Service authority is unavailable", await response.text())
+        self.assertEqual({}, self.services.pending)
+        await self.reply(socket, request, {"late": True})
+        self.services.rpc_timeout = .5
+        next_task = asyncio.create_task(self.post("/api/service-authorities/call", envelope))
+        next_request = await socket.receive_json(timeout=1)
+        self.assertNotEqual(request["id"], next_request["id"])
+        await self.reply(socket, next_request, {"fences": []})
+        next_response = await next_task
+        self.assertEqual(200, next_response.status)
+        self.assertEqual({"result": {"fences": []}}, await next_response.json())
+        self.assertEqual({}, self.services.pending)
+
+    async def test_registration_keeps_its_short_deadline(self):
+        self.services.timeout = .03
+        self.services.rpc_timeout = .5
+        socket = await self.client.ws_connect(self.base + "/service-authority/example/connect",
+                                              headers=self.headers)
+        self.addAsyncCleanup(socket.close)
+        message = await socket.receive(timeout=.2)
+        self.assertIn(message.type, (WSMsgType.CLOSE, WSMsgType.CLOSED))
+        self.assertEqual({}, self.services.links)
 
     async def test_preparation_only_for_provider_recovery_and_original_envelope_unchanged(self):
         socket = await self.authority_socket()
