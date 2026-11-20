@@ -143,6 +143,13 @@ removes the pending correlation and ignores a late reply; it does not cancel or
 replay work already dispatched. Placement and binding are still checked after
 every accepted reply.
 
+Authenticated `GET /api/service-coordinator/status` advertises
+`independent_authority_rpc_timeout` in `supported_features` and reports the current
+`authority_transport.registration_timeout_s` and `authority_transport.rpc_timeout_s`
+values. The production defaults are 5 and 20 respectively. This local status
+observation neither contacts a worker nor configures or admits a service; it can
+verify the deployed feature after a main-branch deployment.
+
 A call RPC is:
 
 ```json
