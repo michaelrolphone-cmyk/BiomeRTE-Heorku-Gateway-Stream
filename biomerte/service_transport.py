@@ -20,7 +20,7 @@ from .stream_router import service_authority_key
 PROTOCOL = "biomerte-service-authority/1"
 PREPARATION_OPERATIONS = frozenset((
     "cap.offer", "provider.poll", "cap.fenced", "provider.result", "cap.status"))
-REPLY_STATUSES = frozenset((200, 400, 401, 403, 404, 409, 429, 503))
+REPLY_STATUSES = frozenset((200, 400, 401, 403, 404, 409, 410, 429, 503))
 
 
 

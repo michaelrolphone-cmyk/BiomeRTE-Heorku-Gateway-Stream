@@ -214,6 +214,22 @@ class ControllerRuntimeRoutingTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(400, response.status)
             await response.read()
 
+    async def test_retained_event_cursor_is_returned_without_rpc_timeout(self):
+        socket = await self.socket()
+        self.active()
+        envelope = self.envelope(PI, "bus.event_page",
+                                 topic="workflow.delegation.requested", after=0, limit=25)
+        pending = asyncio.create_task(self.post(self.call_path, envelope))
+        request = await socket.receive_json(timeout=1)
+        self.assertEqual(envelope, request["envelope"])
+        error = "Event history expired; resynchronize from a snapshot (event floor 17)"
+        await socket.send_json(dict(type="call_result", id=request["id"],
+                                    binding=request["binding"], status=410, error=error))
+        response = await pending
+        self.assertEqual(410, response.status)
+        self.assertEqual({"error": error}, await response.json())
+        self.assertEqual({}, self.services.pending)
+
     async def test_ordered_original_request_identity_is_preserved(self):
         socket = await self.socket()
         self.active()
