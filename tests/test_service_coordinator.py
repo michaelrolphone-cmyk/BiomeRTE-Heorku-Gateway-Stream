@@ -29,7 +29,7 @@ def manifest(**changes):
 
 
 def heartbeat(coordinator, spec, worker="mac", incarnation="boot1",
-              grant=None, **changes):
+              grant=None, lease_scoped=True, **changes):
     platform = "linux/arm/v7" if worker == "pi" else "linux/arm64"
     row = dict(manifest=copy.deepcopy(spec), manifest_revision=spec["revision"],
                platform=platform, image_ref=spec["images"][platform],
@@ -38,7 +38,7 @@ def heartbeat(coordinator, spec, worker="mac", incarnation="boot1",
         row.update(grant_token=grant["grant_token"], boot_epoch=grant["boot_epoch"])
     row.update(changes)
     return coordinator.heartbeat(dict(worker_id=worker,
-        worker_incarnation=incarnation, services=[row]))
+        worker_incarnation=incarnation, services=[row], lease_scoped=lease_scoped))
 
 
 class CoordinatorTests(unittest.TestCase):
@@ -52,6 +52,50 @@ class CoordinatorTests(unittest.TestCase):
         result = heartbeat(self.coordinator, spec or self.spec, worker)
         self.assertEqual({}, result["errors"])
         return result["assignments"][0]
+
+    def test_capability_demand_starts_and_drains_exact_lease_generation(self):
+        spec = manifest(capability_lease={"controller": "a" * 64, "provider": "b" * 64,
+                                        "contract": "workspace.status:1", "resource": "worker"},
+                        health={"command": ["ready"]}, state_policy="lease_scoped")
+        self.clock.advance(10)
+        self.assertEqual([], heartbeat(self.coordinator, spec)["assignments"])
+        old = heartbeat(self.coordinator, spec, "pi", lease_scoped=False)
+        self.assertEqual([], old["manifests"])
+        self.assertEqual([], old["assignments"])
+        self.assertIn("lease-scoped", old["errors"][spec["id"]])
+        self.coordinator.record_capability_demand(spec["id"], spec["revision"], ("c" * 64, 1), 16)
+        grant = heartbeat(self.coordinator, spec)["assignments"][0]
+        self.assertEqual("starting", grant["state"])
+        self.assertFalse(self.coordinator.validate(grant)["valid"])
+        self.assertEqual("starting", heartbeat(self.coordinator, spec, healthy=True)["assignments"][0]["state"])
+        resumed = heartbeat(self.coordinator, spec, grant=grant, healthy=True)["assignments"][0]
+        self.assertEqual(grant["grant_token"], resumed["grant_token"])
+        self.assertEqual("active", resumed["state"])
+        self.assertTrue(self.coordinator.validate(grant)["valid"])
+
+        self.coordinator.record_capability_demand(spec["id"], spec["revision"], None, 16)
+        self.assertFalse(self.coordinator.validate(grant)["valid"])
+        self.coordinator.record_capability_demand(spec["id"], spec["revision"], ("c" * 64, 2), 17)
+        self.assertEqual([], heartbeat(self.coordinator, spec, "pi")["assignments"])
+        self.clock.advance(5)
+        successor = heartbeat(self.coordinator, spec, "pi")["assignments"][0]
+        self.assertNotEqual(grant["grant_token"], successor["grant_token"])
+        self.assertEqual(2, successor["lease_ttl_s"])
+        self.clock.advance(2)
+        self.assertEqual([], heartbeat(self.coordinator, spec, "pi", grant=successor)["assignments"])
+
+    def test_capability_demand_is_not_restored_after_coordinator_restart(self):
+        spec = manifest(capability_lease={"controller": "a" * 64, "provider": "b" * 64,
+                                        "contract": "workspace.status:1", "resource": "worker"},
+                        health={"command": ["ready"]}, state_policy="lease_scoped")
+        self.clock.advance(10)
+        heartbeat(self.coordinator, spec)
+        self.coordinator.record_capability_demand(spec["id"], spec["revision"], ("c" * 64, 1), 16)
+        grant = heartbeat(self.coordinator, spec)["assignments"][0]
+        restarted = Coordinator("test-secret", max_lease_ttl_s=10, clock=self.clock)
+        self.clock.advance(10)
+        self.assertEqual([], heartbeat(restarted, spec, grant=grant)["assignments"])
+        self.assertFalse(restarted.validate(grant)["valid"])
 
     def test_boot_grace_collects_candidates_and_preferred_first_placement(self):
         self.assertEqual([], heartbeat(self.coordinator, self.spec, "mac")["assignments"])
