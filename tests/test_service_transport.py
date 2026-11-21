@@ -6,6 +6,7 @@ import hmac
 import json
 import time
 import unittest
+from unittest.mock import patch
 
 from aiohttp import ClientSession, WSMsgType, web
 
@@ -176,6 +177,26 @@ class ServiceTransportTests(unittest.IsolatedAsyncioTestCase):
         for envelope in (self.envelope(resource=RESOURCE),
                          self.envelope("provider.claim", provider=True)):
             response = await self.post("/api/service-authorities/call", envelope)
+            self.assertEqual(503, response.status)
+            await response.read()
+        attachment = self.envelope("stream.attach", provider=True, role="provider", session="a" * 32)
+        response = await self.post("/api/service-authorities/call", attachment)
+        # Ordinary prepare still supplies a temporary error. A definitive
+        # retry hint requires a verified checkpoint and physical fence wait.
+        self.assertEqual(503, response.status)
+        await response.read()
+        original = self.coordinator.current_grant
+
+        def waiting_for_fence(service_id, *, preparation=False):
+            grant = original(service_id, preparation=preparation)
+            return dict(grant, state="waiting_for_external_fence") if preparation and grant else grant
+
+        with patch.object(self.coordinator, "current_grant", side_effect=waiting_for_fence):
+            response = await self.post("/api/service-authorities/call", attachment)
+            self.assertEqual(409, response.status)
+            self.assertIn("Superseded", (await response.json())["error"])
+            response = await self.post("/api/service-authorities/call",
+                                       self.envelope("stream.attach", role="server", session="a" * 32))
             self.assertEqual(503, response.status)
             await response.read()
         envelope = self.envelope("provider.poll", provider=True, cursor="original")
