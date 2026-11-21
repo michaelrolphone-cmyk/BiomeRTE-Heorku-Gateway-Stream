@@ -261,8 +261,21 @@ class ServiceAuthorities:
             raise web.HTTPForbidden(text="Logical authority is required")
         # Recovery RPCs can reach an inert authority only for declared providers.
         # The adapter restricts poll output/results to fencing and reconciliation.
-        preparation = (provider and operation in PREPARATION_OPERATIONS and
-                       self.coordinator.current_grant(service_id) is None)
+        recovery = provider and operation in PREPARATION_OPERATIONS
+        attachment = (provider and operation == "stream.attach" and
+                      arguments.get("role") == "provider" and
+                      isinstance(arguments.get("session"), str))
+        active = self.coordinator.current_grant(service_id) if recovery or attachment else None
+        if attachment and active is None:
+            preparing = self.coordinator.current_grant(service_id, preparation=True)
+            if preparing and preparing["state"] == "waiting_for_external_fence":
+                # The new authority must establish a physical fence before
+                # any stream can attach. Tell the provider to discard its
+                # old attachment and return to the signed inbox for the fence.
+                return web.json_response(
+                    {"error": "Superseded stream attachment; poll for the new physical fence"},
+                    status=409, headers={"Cache-Control": "no-store"})
+        preparation = recovery and active is None
         value = await self.rpc(service_id, dict(type="call", envelope=envelope),
                                preparation=preparation)
         if value["status"] != 200:
