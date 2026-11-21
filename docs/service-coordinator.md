@@ -51,6 +51,28 @@ Optional placement fields are `lease_ttl_s` (default10), `worker_ttl_s`
 Preferences apply only when choosing a new owner; a healthy active owner stays
 where it is. Intentional handback drains the old grant before another assignment.
 
+### On-demand workers
+
+Set `state_policy` to `lease_scoped` and `capability_lease` to the managed
+controller authority ID and the exact provider, resource and versioned
+contract. This policy covers disposable worker state. Earlier coordinators and
+runners reject it, so mixed-version recovery cannot treat it as continuous.
+The service must declare a Docker health command. The controller must already have an offer for that provider on
+an exclusive, single-capacity resource so callers can acquire a lease while the
+worker is idle. The worker still installs its native capability fence before
+the controller dispatches commands. Services that process continuous input omit
+`capability_lease`.
+
+The gateway learns demand through its authenticated, grant-bound controller
+connection. A fencing or bound lease authorizes placement for its exact lease
+ID and generation. Startup is visible as `starting`. Full service grant
+validation also requires health from the exact running grant. A release,
+expiry, or different lease generation drains the old grant. The host runner
+removes the child on the next heartbeat or at its local grant deadline. A
+replacement still waits out the previous grant's expiry. If the controller
+connection fails, the last demand observation expires after at most six seconds.
+Coordinator restart requires a fresh observation and the ordinary restart grace.
+
 The server maximum lease lifetime defaults to30seconds and is configurable through
 `service_coordinator_max_lease_ttl_s`. This is also the restart grace. Do not lower
 it across a deployment while earlier, longer grants could still be alive; first

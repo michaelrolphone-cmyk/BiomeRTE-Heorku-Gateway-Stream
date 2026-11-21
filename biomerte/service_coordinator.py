@@ -24,6 +24,7 @@ REVISION = re.compile(r"[0-9a-f]{64}\Z")
 ADAPTER_PROTOCOL = "biomerte-service-adapter/1"
 BINDING_KEYS = ("service_id", "manifest_revision", "worker_id",
                 "worker_incarnation", "boot_epoch", "grant_token")
+DEMAND_FIELDS = {"controller", "provider", "resource", "contract"}
 
 
 def grant_binding(value):
@@ -109,7 +110,8 @@ class Coordinator:
             raise ValueError("gateway_fenced is reserved: mandatory routing enforcement is not installed")
         if effect not in ("stateless", "externally_fenced"):
             raise ValueError("explicit supported effect_policy is required")
-        if value.get("state_policy") not in ("stateless", "externally_managed"):
+        state = value.get("state_policy")
+        if state not in ("stateless", "externally_managed", "lease_scoped"):
             raise ValueError("local-only or undeclared state cannot automatically migrate")
         ttl = _number(value.get("lease_ttl_s", 10), "lease_ttl_s")
         if ttl > self.max_lease_ttl_s:
@@ -130,6 +132,19 @@ class Coordinator:
             if effect != "externally_fenced":
                 raise ValueError("an activation adapter requires external fencing")
         authority = value.get("authority")
+        demand = value.get("capability_lease")
+        if (demand is not None) != (state == "lease_scoped"):
+            raise ValueError("Capability demand requires the lease_scoped state policy")
+        if demand is not None:
+            if (not isinstance(demand, dict) or set(demand) != DEMAND_FIELDS or
+                    any(not isinstance(v, str) or not 0 < len(v) <= 192 for v in demand.values()) or
+                    not REVISION.fullmatch(demand["controller"]) or
+                    not REVISION.fullmatch(demand["provider"])):
+                raise ValueError("capability_lease requires exact controller, provider, resource and contract")
+            if activation is not None or authority is not None:
+                raise ValueError("Lease-scoped workers cannot own a staged authority")
+            if not isinstance(value.get("health"), dict) or not value["health"].get("command"):
+                raise ValueError("Capability lease placement requires a worker readiness probe")
         if authority is not None:
             if not activation or not isinstance(authority, dict):
                 raise ValueError("logical authority requires an activation adapter")
@@ -204,6 +219,32 @@ class Coordinator:
         item["conflicting_revisions"].clear()
         item["configured"] = True
         return self._summary(manifest["id"], item, now)
+
+    def record_capability_demand(self, service_id, revision, lease, deadline):
+        item = self.services.get(service_id)
+        if (not item or item["manifest"]["revision"] != revision or
+                not item["manifest"].get("capability_lease")):
+            return
+        now = self.clock()
+        if deadline <= now:
+            return
+        item["demand"] = (revision, lease, deadline)
+        self._reconcile(service_id, item, now)
+
+    def _demand(self, item, now):
+        demand = item.get("demand")
+        if demand and demand[0] == item["manifest"]["revision"] and now < demand[2]:
+            return demand[1], demand[2]
+        return None, None
+
+    def _deadline(self, item, now):
+        ends = [now + item["manifest"].get("lease_ttl_s", 10)]
+        if self.witness_deadline:
+            ends.append(self.witness_deadline())
+        unused, deadline = self._demand(item, now)
+        if deadline is not None:
+            ends.append(deadline)
+        return min(ends)
 
     def _candidate_reason(self, item, candidate, now, grant=None):
         manifest = item["manifest"]
@@ -336,6 +377,13 @@ class Coordinator:
                 grant["draining"] = True
             item["reason"] = "replica_revision_conflict"
             return
+        demand, unused = self._demand(item, now)
+        if manifest.get("capability_lease") and (demand is None or
+                (grant and demand != grant.get("capability_demand"))):
+            if grant:
+                grant["draining"] = True
+            item["reason"] = "waiting_for_capability_lease" if demand is None else "capability_lease_draining"
+            return
         if grant:
             candidate = item["candidates"].get(grant["worker_key"])
             reason = self._candidate_reason(item, candidate, now, grant)
@@ -384,8 +432,7 @@ class Coordinator:
             manifest_revision=manifest["revision"], boot_epoch=self.boot_epoch,
             grant_token=secrets.token_urlsafe(32), worker_key=worker_key,
             worker_id=worker_key[0], worker_incarnation=worker_key[1],
-            started=now, expires=min(now + manifest.get("lease_ttl_s", 10), durable_limit)
-                if durable_limit is not None else now + manifest.get("lease_ttl_s", 10),
+            started=now, expires=self._deadline(item, now), capability_demand=demand,
             draining=False)
         item["reason"] = ("awaiting_state_preparation" if manifest.get("activation") else
                           "awaiting_external_fence"
@@ -415,6 +462,7 @@ class Coordinator:
         worker = _text(body.get("worker_id"), "worker_id")
         incarnation = _text(body.get("worker_incarnation"), "worker_incarnation")
         rows = body.get("services")
+        supports_lease_scoped = body.get("lease_scoped") is True
         if not isinstance(rows, list):
             raise ValueError("services must be a list")
         now = self.clock()
@@ -429,6 +477,8 @@ class Coordinator:
                     raise ValueError("service heartbeat must be an object")
                 manifest = self._manifest(row.get("manifest"))
                 service_id = manifest["id"]
+                if manifest["state_policy"] == "lease_scoped" and not supports_lease_scoped:
+                    raise ValueError("Worker has not advertised lease-scoped lifecycle support")
                 if service_id in seen_ids:
                     raise ValueError("duplicate service heartbeat")
                 seen_ids.add(service_id)
@@ -451,22 +501,27 @@ class Coordinator:
                         item["conflicting_revisions"].update(
                             (item["manifest"]["revision"], manifest["revision"]))
                     raise Conflict("manifest_conflict: configure with expected_revision")
+                grant = item["grant"]
+                identity = dict(row, worker_id=worker, worker_incarnation=incarnation)
+                matched = self._matches(grant, identity)
+                healthy = row.get("healthy")
+                if manifest.get("capability_lease") and not matched:
+                    healthy = None  # Health from a container with different custody cannot admit this grant.
                 candidate = dict(seen=now, manifest_revision=manifest["revision"],
                     platform=platform, image_ref=image_ref, prepared=row["prepared"],
                     dependencies_ready=row["dependencies_ready"],
-                    healthy=row.get("healthy"), fence_ack=row.get("fence_ack"),
+                    healthy=healthy, fence_ack=row.get("fence_ack"),
                     state_ready=row.get("state_ready"), state_proof=row.get("state_proof"),
                     checkpoint=row.get("checkpoint"))
                 item["candidates"][(worker, incarnation)] = candidate
                 item["last_seen"] = now
                 accepted_ids.add(service_id)
-                grant = item["grant"]
-                identity = dict(row, worker_id=worker, worker_incarnation=incarnation)
-                if (self._matches(grant, identity) and not grant["draining"] and
+                if (matched and not grant["draining"] and
                         self._candidate_reason(item, candidate, now, grant) is None):
-                    limit = self.witness_deadline() if self.witness_deadline else None
-                    grant["expires"] = (min(now + manifest.get("lease_ttl_s", 10), limit)
-                        if limit is not None else now + manifest.get("lease_ttl_s", 10))
+                    demand, unused = self._demand(item, now)
+                    if (not manifest.get("capability_lease") or
+                            (demand is not None and demand == grant.get("capability_demand"))):
+                        grant["expires"] = self._deadline(item, now)
                     if self._fence_ready(item, candidate, grant):
                         grant["fence_ack"] = candidate.get("fence_ack") or grant.get("fence_ack")
                 self._reconcile(service_id, item, now)
@@ -484,7 +539,8 @@ class Coordinator:
         return dict(protocol=PROTOCOL, boot_epoch=self.boot_epoch,
                     boot_grace_remaining_s=max(0, self.boot_until - now),
                     assignments=assignments, statuses=statuses, errors=errors,
-                    manifests=self._catalog_manifests(),
+                    manifests=[m for m in self._catalog_manifests()
+                               if supports_lease_scoped or m["state_policy"] != "lease_scoped"],
                     configured_revisions=self._configured_revisions())
 
     def _grant_view(self, item, now):
@@ -497,6 +553,9 @@ class Coordinator:
                      state=item["reason"],
                      state_ready=self._state_ready(item, candidate, grant),
                      effect_ready=self._fence_ready(item, candidate, grant))
+        if item["manifest"].get("capability_lease"):
+            lease_id, generation = grant["capability_demand"]
+            value["capability_demand"] = {"id": lease_id, "generation": generation}
         return value
 
     def _summary(self, service_id, item, now):
@@ -617,6 +676,8 @@ class Coordinator:
             candidate = item["candidates"].get(grant["worker_key"], {})
             valid = self._fence_ready(item, candidate, grant)
             reason = "valid" if valid else "awaiting_external_fence"
+            if valid and item["manifest"].get("capability_lease") and candidate.get("healthy") is not True:
+                valid, reason = False, "awaiting_worker_readiness"
         return dict(valid=bool(valid), reason=reason, boot_epoch=self.boot_epoch,
                     lease_ttl_s=max(0, grant["expires"] - now) if valid else 0)
 
