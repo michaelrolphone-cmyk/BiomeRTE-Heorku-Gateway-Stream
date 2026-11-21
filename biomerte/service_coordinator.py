@@ -551,16 +551,22 @@ class Coordinator:
             services={sid: self._summary(sid, item, now)
                       for sid, item in self.services.items()})
 
+    def preparation_binding(self, value, now):
+        """Check identity and expiry without reconciling checkpoint readiness."""
+        item = self.services.get(value.get("service_id")) if isinstance(value, dict) else None
+        grant = item["grant"] if item else None
+        if (grant and exact_binding(value, grant) and grant["boot_epoch"] == self.boot_epoch
+                and not grant["draining"] and now < grant["expires"]
+                and grant["manifest_revision"] == item["manifest"]["revision"]):
+            return grant
+        return None
+
     def validate_preparation(self, value):
         """Admission for staging/recovery only; this is never an effect grant."""
         now = self.clock()
         self._prune(now)
-        item = self.services.get(value.get("service_id")) if isinstance(value, dict) else None
-        grant = item["grant"] if item else None
-        valid = bool(grant and exact_binding(value, grant) and
-                     grant["boot_epoch"] == self.boot_epoch and
-                     not grant["draining"] and now < grant["expires"] and
-                     grant["manifest_revision"] == item["manifest"]["revision"])
+        grant = self.preparation_binding(value, now)
+        valid = grant is not None
         return dict(valid=valid, reason="valid_preparation" if valid else "stale_or_revoked_grant",
                     boot_epoch=self.boot_epoch,
                     lease_ttl_s=max(0, grant["expires"] - now) if valid else 0)

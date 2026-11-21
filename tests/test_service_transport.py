@@ -333,6 +333,62 @@ class ServiceTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("package", self.helpers.head("example"))
         self.assertEqual({}, self.helpers.pending)
 
+    async def test_durable_publication_preserves_active_binding_past_startup(self):
+        case = self
+
+        class Witness:
+            sequence, digest = 1, "a" * 64
+
+            def head(self, service_id):
+                return dict(service_id=service_id, sequence=self.sequence,
+                            digest=self.digest, binding=None,
+                            boot_epoch=case.coordinator.boot_epoch,
+                            durable_witness=True)
+
+            async def commit(self, packet):
+                self.sequence, self.digest = 2, "b" * 64
+
+        witness = Witness()
+        self.helpers.durable_witness = witness
+        self.active()
+        started = self.coordinator.services["example"]["grant"]["started"]
+        while self.clock() - started <= self.spec["startup_grace_s"]:
+            self.clock.advance(1)
+            heartbeat(self.coordinator, self.spec, "pi", grant=self.grant,
+                      healthy=True, **readiness(self.grant))
+        response = await self.post("/api/service-checkpoints/replicate",
+                                   self.replicate(self.checkpoint(2, "b" * 64)), True)
+        reply = await response.json() if response.status == 200 else await response.text()
+        self.assertEqual(200, response.status, reply)
+        self.assertEqual(self.binding, reply["head"]["binding"])
+        self.assertEqual(2, reply["head"]["sequence"])
+        self.assertTrue(self.coordinator.validate(self.binding)["valid"])
+
+    async def test_late_durable_commit_does_not_attach_a_stale_binding(self):
+        case = self
+
+        class Witness:
+            sequence, digest = 1, "a" * 64
+
+            def head(self, service_id):
+                return dict(service_id=service_id, sequence=self.sequence,
+                            digest=self.digest, binding=None,
+                            boot_epoch=case.coordinator.boot_epoch,
+                            durable_witness=True)
+
+            async def commit(self, packet):
+                case.clock.advance(20)
+                self.sequence, self.digest = 2, "b" * 64
+
+        self.helpers.durable_witness = Witness()
+        self.active()
+        response = await self.post("/api/service-checkpoints/replicate",
+                                   self.replicate(self.checkpoint(2, "b" * 64)), True)
+        self.assertEqual(409, response.status)
+        await response.read()
+        self.assertEqual(2, self.helpers.head("example")["sequence"])
+        self.assertIsNone(self.helpers.head("example")["binding"])
+
     async def test_checkpoint_high_water_is_monotonic_and_is_lost_on_restart(self):
         response = await self.post("/api/service-checkpoints/replicate",
                                    self.replicate(self.checkpoint(3)), True)
