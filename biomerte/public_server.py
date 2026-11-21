@@ -6,6 +6,7 @@ from .rover_transport import Ingress
 from .authority_transport import Authorities
 from .service_coordinator import Coordinator
 from .service_transport import ServiceAuthorities
+from . import service_demand
 from .checkpoint_transport import CheckpointWorkers
 from .durable_witness import DurableWitness
 
@@ -70,6 +71,14 @@ def application(config):
     if owner not in ('hosted','mac_bridge'):
         raise ValueError('Unknown native session owner')
     app = web.Application(client_max_size=0)
+    async def watch_capability_demand(app):
+        task = asyncio.create_task(service_demand.watch(coordinator, services))
+        try:
+            yield
+        finally:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+    app.cleanup_ctx.append(watch_capability_demand)
     if durable:
         async def start_witness(app):
             durable.session = ClientSession()
