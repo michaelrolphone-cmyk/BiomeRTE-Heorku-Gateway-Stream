@@ -320,10 +320,21 @@ class CheckpointWorkers:
                         await self.durable_witness.commit(checkpoint["package"])
                     except (WitnessError, asyncio.TimeoutError, OSError):
                         raise web.HTTPServiceUnavailable(text="Durable checkpoint witness unavailable")
-                    if not self.coordinator.validate_preparation(binding)["valid"]:
+                    if self.coordinator.preparation_binding(binding, self.coordinator.clock()) is None:
                         raise web.HTTPConflict(text="Checkpoint grant changed during durable publication")
+                # The witness may have advanced to a head with no in-memory binding.
+                # Reconcile only after publishing its exact same-grant binding in
+                # this event-loop turn, with no intervening await.
+                self.head(service_id)
+                previous = self.heads.get(service_id)
                 self.heads[service_id] = dict(identity, binding=dict(binding),
                                               boot_epoch=self.coordinator.boot_epoch)
+                if self.durable_witness and not self.coordinator.validate_preparation(binding)["valid"]:
+                    if previous is None:
+                        self.heads.pop(service_id, None)
+                    else:
+                        self.heads[service_id] = previous
+                    raise web.HTTPConflict(text="Checkpoint grant changed during durable publication")
                 if checkpoint["package"].get("payload", {}).get("state", {}).get("format") == "biomerte-controller-state/1":
                     # This authenticated notification only permits local payload
                     # GC after head publication. It is not another commit vote.
