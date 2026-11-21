@@ -1,0 +1,1 @@
+GitHub-to-Heroku rollback qualification, 2026-11-21. Runtime source is byte-identical to baseline.
