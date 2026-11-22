@@ -354,6 +354,47 @@ class ServiceTransportTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("package", self.helpers.head("example"))
         self.assertEqual({}, self.helpers.pending)
 
+    async def test_owner_only_reference_requires_witness_grant_and_empty_replica_set(self):
+        from unittest.mock import AsyncMock, Mock
+        ref = {"service_id": "example", "sequence": 2, "digest": "b" * 64}
+        scope, parent = "c" * 64, "a" * 64
+        body = dict(self.replicate(ref), witness_reference={
+            "scope_digest": scope, "previous_digest": parent})
+        path = "/api/service-checkpoints/replicate"
+
+        async def send(value, status):
+            response = await self.post(path, value, True)
+            self.assertEqual(status, response.status, await response.text())
+            return await response.json() if status == 200 else None
+
+        await send(body, 409)
+        witness = Mock()
+        witness.head.return_value = None
+        witness.commit_reference = AsyncMock()
+        self.helpers.durable_witness = witness
+        await send(body, 409)
+        witness.head.return_value = dict(ref, sequence=1, digest=parent,
+                                         boot_epoch=self.binding["boot_epoch"])
+        await send(dict(body, binding=dict(self.binding, grant_token="old")), 409)
+        await send(dict(body, local_durable=False), 400)
+        await send(dict(body, targets=[dict(worker_id="mac", worker_incarnation="boot1")]), 400)
+        await send(dict(body, witness_reference=dict(scope_digest=scope, previous_digest="bad")), 400)
+        witness.commit_reference.assert_not_awaited()
+        value = await send(body, 200)
+        self.assertTrue(value["owner_only_witness_reference"])
+        self.assertEqual(ref, value["checkpoint"])
+        self.assertEqual([], value["acknowledgements"])
+        witness.commit_reference.assert_awaited_once_with(dict(ref, scope_digest=scope), parent)
+
+        # A helper joining during the CAS requires a renewed target selection
+        # and full replication before the publisher receives a successful reply.
+        async def joining(*args):
+            await self.helper_socket()
+        witness.commit_reference.side_effect = joining
+        await send(body, 409)
+        await send(body, 409)
+        self.assertEqual(2, witness.commit_reference.await_count)
+
     async def test_durable_publication_preserves_active_binding_past_startup(self):
         case = self
 
