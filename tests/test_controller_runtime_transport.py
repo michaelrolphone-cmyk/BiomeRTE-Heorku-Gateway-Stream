@@ -95,6 +95,51 @@ class ControllerManifestTests(unittest.TestCase):
             self.configure(spec)
 
 
+class ControllerStartupTests(unittest.TestCase):
+    def setUp(self):
+        self.clock = Clock()
+        self.coordinator = Coordinator(SECRET, max_lease_ttl_s=10, clock=self.clock,
+                                       reserved_authorities=[PI, MAC])
+        self.spec = controller_manifest(startup_grace_s=8)
+        self.clock.advance(10)
+        self.grant = heartbeat(self.coordinator, self.spec, "mac")["assignments"][0]
+        self.binding = grant_binding(self.grant)
+        self.coordinator.checkpoint_head = lambda service: dict(
+            service_id=service, sequence=1, digest="a" * 64,
+            binding=self.binding, boot_epoch=self.coordinator.boot_epoch)
+        self.prepared = readiness(self.grant)
+        self.prepared.pop("fence_ack")
+
+    def report(self, **proof):
+        self.clock.advance(2)
+        return heartbeat(self.coordinator, self.spec, "mac", grant=self.grant, **proof)
+
+    def test_slow_preparation_does_not_consume_fencing_and_health_budgets(self):
+        self.report()
+        self.report()
+        pending = self.report(**self.prepared)["assignments"][0]
+        self.assertEqual("awaiting_external_fence", pending["state"])
+        waiting = self.report(**self.prepared)["assignments"][0]
+        self.assertEqual(self.binding, grant_binding(waiting))
+        self.assertFalse(self.coordinator.validate(self.binding)["valid"])
+        self.report(**self.prepared)
+        starting = self.report(**readiness(self.grant))["assignments"][0]
+        self.assertEqual("starting", starting["state"])
+        self.report(**readiness(self.grant))
+        self.report(**readiness(self.grant))
+        active = self.report(healthy=True, **readiness(self.grant))["assignments"][0]
+        self.assertEqual("active", active["state"])
+        self.assertEqual(self.binding, grant_binding(active))
+
+    def test_repeated_preparation_does_not_extend_fencing_budget(self):
+        self.report(**self.prepared)
+        for _ in range(3):
+            self.assertEqual(1, len(self.report(**self.prepared)["assignments"]))
+        stopped = self.report(**self.prepared)
+        self.assertEqual([], stopped["assignments"])
+        self.assertFalse(self.coordinator.validate_preparation(self.binding)["valid"])
+
+
 class ControllerRuntimeRoutingTests(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
         self.clock = Clock()

@@ -266,7 +266,13 @@ class Coordinator:
         if candidate["healthy"] is False:
             return "service_unhealthy"
         if grant and candidate["healthy"] is None:
-            if self._verified_fence_wait(item, candidate, grant):
+            started = None
+            if (manifest.get("authority") or {}).get("kind") == "controller":
+                # A whole-site controller can spend most of its initial budget
+                # restoring a checkpoint. Health is meaningful after fencing.
+                if self._fence_ready(item, candidate, grant):
+                    started = grant.setdefault("activation_started", now)
+            elif self._verified_fence_wait(item, candidate, grant):
                 grant["external_fence_wait"] = True
             else:
                 # A real fence ends the external wait. Activation still gets a
@@ -276,8 +282,8 @@ class Coordinator:
                         self._fence_ready(item, candidate, grant)):
                     grant["activation_started"] = now
                 started = grant.get("activation_started", grant["started"])
-                if now - started >= manifest.get("startup_grace_s", 20):
-                    return "startup_health_timeout"
+            if started is not None and now - started >= manifest.get("startup_grace_s", 20):
+                return "startup_health_timeout"
         if candidate.get("released"):
             return "worker_released"
         return None
@@ -401,12 +407,15 @@ class Coordinator:
                 else:
                     item["reason"] = "awaiting_state_preparation"
                 return
+            fence_started = grant["started"]
+            if (manifest.get("authority") or {}).get("kind") == "controller":
+                fence_started = grant.setdefault("fence_started", now)
             if (manifest["effect_policy"] == "externally_fenced" and
                     not self._fence_ready(item, candidate, grant)):
                 if self._verified_fence_wait(item, candidate, grant):
                     grant["external_fence_wait"] = True
                     item["reason"] = "waiting_for_external_fence"
-                elif now - grant["started"] >= manifest.get("startup_grace_s", 20):
+                elif now - fence_started >= manifest.get("startup_grace_s", 20):
                     grant["draining"] = True
                     item["reason"] = "external_fence_timeout"
                 else:
