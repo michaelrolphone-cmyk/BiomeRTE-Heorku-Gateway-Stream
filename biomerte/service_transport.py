@@ -99,6 +99,13 @@ class ServiceAuthorities:
             return False
         return preparation or self.coordinator.validate(binding)["valid"]
 
+    def _detach_requests(self, link):
+        for identity, pending in list(self.pending.items()):
+            if pending["link"] is link:
+                self.pending.pop(identity)
+                if not pending["future"].done():
+                    pending["future"].set_result(None)
+
     async def connect(self, request):
         authorize_coordinator(request, self.coordinator)
         service_id = request.match_info["service_id"]
@@ -122,6 +129,9 @@ class ServiceAuthorities:
             link = dict(socket=socket, binding=dict(binding), registered=False)
             self.links[service_id] = link
             if old:
+                # The old grant has lost authority. Its close handshake must
+                # not hold RPC slots that the replacement needs to recover.
+                self._detach_requests(old)
                 closing = asyncio.create_task(old["socket"].close(
                     code=1008, message=b"Superseded service grant"))
                 self.closing.add(closing)
@@ -164,9 +174,7 @@ class ServiceAuthorities:
             if link is not None:
                 if self.links.get(service_id) is link:
                     self.links.pop(service_id, None)
-                for pending in list(self.pending.values()):
-                    if pending["link"] is link and not pending["future"].done():
-                        pending["future"].set_exception(ConnectionError("Authority disconnected"))
+                self._detach_requests(link)
         return socket
 
     async def rpc(self, service_id, payload, *, preparation=False):
@@ -184,6 +192,8 @@ class ServiceAuthorities:
             await link["socket"].send_json(dict(payload, id=identity,
                 binding=link["binding"], preparation=preparation))
             value = await asyncio.wait_for(future, self.rpc_timeout)
+            if value is None:
+                raise ConnectionError("Authority disconnected")
             if not self._admitted(service_id, link, preparation):
                 raise web.HTTPServiceUnavailable(text="Service placement changed during request")
             return value

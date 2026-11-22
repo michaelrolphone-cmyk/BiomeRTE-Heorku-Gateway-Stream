@@ -6,6 +6,7 @@ import hmac
 import json
 import time
 import unittest
+from unittest.mock import patch
 
 from aiohttp import ClientSession, WSMsgType, web
 
@@ -305,6 +306,51 @@ class ControllerRuntimeRoutingTests(unittest.IsolatedAsyncioTestCase):
         await resumed.send_json({"type": "register", "binding": self.binding})
         self.assertIn((await resumed.receive(timeout=1)).type, (WSMsgType.CLOSE, WSMsgType.CLOSED))
         await resumed.close()
+
+    async def test_replacement_can_retry_while_old_socket_is_still_closing(self):
+        self.services.limit = 1
+        self.services.rpc_timeout = 4
+        old = await self.socket()
+        self.active()
+        envelope = self.envelope(None, "provider.poll", provider=ACTOR)
+        first = asyncio.create_task(self.post(self.call_path, envelope))
+        await old.receive_json(timeout=1)
+        old_socket = self.services.links["runtime"]["socket"]
+        finish_close = asyncio.Event()
+        closing = asyncio.Event()
+        close = old_socket.close
+
+        async def slow_close(*args, **kwargs):
+            closing.set()
+            await finish_close.wait()
+            return await close(*args, **kwargs)
+
+        try:
+            with patch.object(old_socket, "close", side_effect=slow_close):
+                self.clock.advance(6)
+                replacement = heartbeat(self.coordinator, self.spec, "mac")["assignments"][0]
+                self.active(replacement, "mac")
+                new = await self.socket(grant_binding(replacement))
+                await asyncio.wait_for(closing.wait(), 1)
+
+                retry = asyncio.create_task(self.post(self.call_path, envelope))
+                try:
+                    request = await new.receive_json(timeout=1)
+                    self.assertEqual(envelope, request["envelope"])
+                    await self.answer(new, request, {"fences": [], "actions": []})
+                finally:
+                    response = await retry
+                    self.assertEqual(200, response.status)
+                    await response.read()
+                response = await asyncio.wait_for(first, 1)
+                self.assertEqual(503, response.status)
+                await response.read()
+                self.assertEqual({}, self.services.pending)
+        finally:
+            finish_close.set()
+            if not first.done():
+                response = await first
+                await response.read()
 
     async def test_physical_endpoint_cannot_silently_adopt_runtime_semantics(self):
         await self.socket()
