@@ -7,7 +7,6 @@ from aiohttp import web
 from .service_coordinator import REVISION
 
 LOG = logging.getLogger(__name__)
-OBSERVATION_TTL_S = 6
 POLL_INTERVAL_S = 1
 
 
@@ -19,6 +18,10 @@ async def observe(coordinator, authorities, manifests):
     if not found or found[1].get("kind") != "controller":
         return
     started = coordinator.clock()
+    # The authorization budget begins before the RPC, so transport latency is charged.
+    # Each pooled slot keeps the lifetime declared by its own service manifest.
+    lifetimes = {m["id"]: min(m.get("lease_ttl_s", 10), coordinator.max_lease_ttl_s)
+                 for m in manifests}
     arguments = {key: scope[key] for key in ("provider", "resource", "contract")}
     pooled = "slot" in scope
     if pooled:
@@ -26,7 +29,7 @@ async def observe(coordinator, authorities, manifests):
     try:
         reply = await asyncio.wait_for(
             authorities.rpc(found[0], dict(type="capability_demand", scope=arguments)),
-            timeout=OBSERVATION_TTL_S - 1)
+            timeout=max(lifetimes.values()))
     except (OSError, asyncio.TimeoutError, web.HTTPException):
         return
     if not isinstance(reply, dict) or reply.get("status") != 200:
@@ -50,7 +53,7 @@ async def observe(coordinator, authorities, manifests):
                 continue
             binding = (lease_id, generation)
         coordinator.record_capability_demand(manifest["id"], manifest["revision"],
-                                             binding, started + OBSERVATION_TTL_S)
+                                             binding, started + lifetimes[manifest["id"]])
 
 
 async def watch(coordinator, authorities):

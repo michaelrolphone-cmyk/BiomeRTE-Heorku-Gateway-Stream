@@ -354,6 +354,42 @@ class DemandWatcherTests(unittest.IsolatedAsyncioTestCase):
         grant = heartbeat(coordinator, specs[1])["assignments"][0]
         self.assertEqual({"id": "c"*64, "generation": 3}, grant["capability_demand"])
 
+    async def test_delayed_snapshot_renews_each_slot_only_for_its_declared_lifetime(self):
+        from biomerte import service_demand
+        from types import SimpleNamespace
+
+        clock = Clock()
+        coordinator = Coordinator("cadence", clock=clock, max_lease_ttl_s=15)
+        clock.advance(15)
+        specs = []
+        lease = {"id": "c" * 64, "generation": 3}
+        for slot, ttl in enumerate((3, 15)):
+            spec = manifest(id="timed-" + str(slot), lease_ttl_s=ttl, worker_ttl_s=30,
+                            state_policy="lease_scoped", health={"command": ["ready"]},
+                            capability_lease=dict(controller="a"*64, provider="b"*64,
+                                                  resource="pool", contract="job:1", slot=slot))
+            coordinator.configure(spec)
+            specs.append(spec)
+
+        async def slow_reply(*unused):
+            clock.advance(4)
+            return {"status": 200, "result": {"slots": {"0": lease, "1": lease}}}
+
+        authority = SimpleNamespace(scope=lambda **unused: ("link", {"kind": "controller"}), rpc=slow_reply)
+        await service_demand.observe(coordinator, authority, specs)
+        self.assertFalse(heartbeat(coordinator, specs[0])["assignments"])
+        first = heartbeat(coordinator, specs[1])["assignments"][0]
+        self.assertEqual(first["lease_ttl_s"], 11)
+        clock.advance(3)
+        await service_demand.observe(coordinator, authority, specs)
+        renewed = heartbeat(coordinator, specs[1], grant=first)["assignments"][0]
+        self.assertEqual(renewed["grant_token"], first["grant_token"])
+        self.assertEqual(renewed["lease_ttl_s"], 11)
+        self.assertEqual("leased", coordinator.status()["services"]["timed-1"]["capability_demand"]["state"])
+        clock.advance(11)
+        self.assertFalse(heartbeat(coordinator, specs[1])["assignments"])
+        self.assertEqual("stale", coordinator.status()["services"]["timed-1"]["capability_demand"]["state"])
+
     async def test_slow_or_failed_controller_does_not_block_other_observations(self):
         from biomerte import service_demand
         coordinator = Coordinator("watch-test")
