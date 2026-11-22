@@ -330,6 +330,30 @@ class CoordinatorTests(unittest.TestCase):
 
 
 class DemandWatcherTests(unittest.IsolatedAsyncioTestCase):
+    async def test_pooled_slots_share_one_read_and_grants_follow_their_own_slot(self):
+        from biomerte import service_demand
+        from types import SimpleNamespace
+        clock = Clock()
+        coordinator = Coordinator("pool", clock=clock, max_lease_ttl_s=10)
+        specs = []
+        for slot in (0, 1):
+            spec = manifest(id="pool-" + str(slot), state_policy="lease_scoped",
+                            capability_lease=dict(controller="a"*64, provider="b"*64,
+                                                  resource="pool", contract="job:1", slot=slot),
+                            health={"command": ["ready"]})
+            coordinator.configure(spec)
+            specs.append(spec)
+        clock.advance(10)
+        read = mock.AsyncMock(return_value={"status": 200, "result": {"slots": {
+            "0": None, "1": {"id": "c"*64, "generation": 3}}}})
+        authorities = SimpleNamespace(scope=lambda **unused: ("link", {"kind": "controller"}), rpc=read)
+        await service_demand.observe(coordinator, authorities, specs)
+        read.assert_awaited_once()
+        self.assertEqual([0, 1], read.await_args.args[1]["scope"]["slots"])
+        self.assertFalse(heartbeat(coordinator, specs[0])["assignments"])
+        grant = heartbeat(coordinator, specs[1])["assignments"][0]
+        self.assertEqual({"id": "c"*64, "generation": 3}, grant["capability_demand"])
+
     async def test_slow_or_failed_controller_does_not_block_other_observations(self):
         from biomerte import service_demand
         coordinator = Coordinator("watch-test")
@@ -341,8 +365,8 @@ class DemandWatcherTests(unittest.IsolatedAsyncioTestCase):
         blocked, cancelled, refreshed = asyncio.Event(), asyncio.Event(), asyncio.Event()
         calls = {"slow": 0, "fast": 0}
 
-        async def observe(unused_coordinator, unused_authorities, spec):
-            name = spec["id"]
+        async def observe(unused_coordinator, unused_authorities, group):
+            name = group[0]["id"]
             calls[name] += 1
             if name == "slow":
                 blocked.set()
