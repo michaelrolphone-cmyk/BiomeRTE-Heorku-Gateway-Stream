@@ -1,4 +1,6 @@
+import asyncio
 import copy
+from unittest import mock
 import unittest
 
 from aiohttp import ClientSession, web
@@ -325,6 +327,47 @@ class CoordinatorTests(unittest.TestCase):
         self.clock.advance(301)
         self.assertEqual({}, self.coordinator.status()["services"])
         self.assertFalse(self.coordinator.validate(grant)["valid"])
+
+
+class DemandWatcherTests(unittest.IsolatedAsyncioTestCase):
+    async def test_slow_or_failed_controller_does_not_block_other_observations(self):
+        from biomerte import service_demand
+        coordinator = Coordinator("watch-test")
+        for name in ("slow", "fast"):
+            item = manifest(id=name, state_policy="lease_scoped", health={"command": ["true"]},
+                            capability_lease=dict(controller="a"*64, provider="b"*64,
+                                                  resource=name, contract="job:1"))
+            coordinator.configure(item)
+        blocked, cancelled, refreshed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+        calls = {"slow": 0, "fast": 0}
+
+        async def observe(unused_coordinator, unused_authorities, spec):
+            name = spec["id"]
+            calls[name] += 1
+            if name == "slow":
+                blocked.set()
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.set()
+            elif calls[name] == 1:
+                raise ConnectionResetError("controller disconnected")
+            else:
+                refreshed.set()
+
+        with mock.patch.object(service_demand, "observe", observe), \
+                mock.patch.object(service_demand, "POLL_INTERVAL_S", .01):
+            watcher = asyncio.create_task(service_demand.watch(coordinator, None))
+            try:
+                await asyncio.wait_for(blocked.wait(), 1)
+                await asyncio.wait_for(refreshed.wait(), 1)
+                self.assertEqual(1, calls["slow"])
+                del coordinator.services["slow"]
+                await asyncio.wait_for(cancelled.wait(), 1)
+                self.assertFalse(watcher.done())
+            finally:
+                watcher.cancel()
+                await asyncio.gather(watcher, return_exceptions=True)
 
 
 class CoordinatorHttpTests(unittest.IsolatedAsyncioTestCase):

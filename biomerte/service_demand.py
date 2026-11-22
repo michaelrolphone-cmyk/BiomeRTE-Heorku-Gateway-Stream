@@ -1,11 +1,14 @@
 """Read exact lease demand over the existing managed controller connection."""
 import asyncio
+import logging
 
 from aiohttp import web
 
 from .service_coordinator import REVISION
 
+LOG = logging.getLogger(__name__)
 OBSERVATION_TTL_S = 6
+POLL_INTERVAL_S = 1
 
 
 async def observe(coordinator, authorities, manifest):
@@ -19,8 +22,10 @@ async def observe(coordinator, authorities, manifest):
         reply = await asyncio.wait_for(
             authorities.rpc(found[0], dict(type="capability_demand", scope=arguments)),
             timeout=OBSERVATION_TTL_S - 1)
-    except (asyncio.TimeoutError, web.HTTPException):
+    except (OSError, asyncio.TimeoutError, web.HTTPException):
         return  # Last observed permission can only last until its original deadline.
+    if not isinstance(reply, dict):
+        return
     result = reply.get("result")
     if reply.get("status") != 200 or not isinstance(result, dict) or "lease" not in result:
         return
@@ -39,9 +44,24 @@ async def observe(coordinator, authorities, manifest):
 
 
 async def watch(coordinator, authorities):
-    while True:
-        manifests = [item["manifest"] for item in coordinator.services.values()
-                     if item["manifest"].get("capability_lease")]
-        if manifests:
-            await asyncio.gather(*(observe(coordinator, authorities, m) for m in manifests))
-        await asyncio.sleep(1)
+    pending = {}
+    try:
+        while True:
+            current = {(m["id"], m["revision"]): m for item in coordinator.services.values()
+                       for m in (item["manifest"],) if m.get("capability_lease")}
+            for key, task in list(pending.items()):
+                if key not in current:
+                    task.cancel()
+                if task.done():
+                    del pending[key]
+                    if not task.cancelled() and task.exception() is not None:
+                        LOG.warning("Lease observation for %s failed (%s)", key[0],
+                                    type(task.exception()).__name__)
+            for key, manifest in current.items():
+                if key not in pending:
+                    pending[key] = asyncio.create_task(observe(coordinator, authorities, manifest))
+            await asyncio.sleep(POLL_INTERVAL_S)
+    finally:
+        for task in pending.values():
+            task.cancel()
+        await asyncio.gather(*pending.values(), return_exceptions=True)
