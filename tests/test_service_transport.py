@@ -119,6 +119,33 @@ class ServiceTransportTests(unittest.IsolatedAsyncioTestCase):
                          value["authority_transport"])
         self.assertNotIn(self.binding["grant_token"], str(value))
 
+    async def test_registered_authority_receives_the_budget_enforced_on_its_calls(self):
+        self.services.limit = 1
+        self.services.rpc_timeout = .7
+        socket = await self.client.ws_connect(self.base + "/service-authority/example/connect",
+                                              headers=self.headers)
+        self.addAsyncCleanup(socket.close)
+        await socket.send_json({"type": "register", "binding": self.binding})
+        registration = await socket.receive_json(timeout=1)
+        self.assertEqual("registered", registration["type"])
+        self.assertEqual("biomerte-service-authority/1", registration["protocol"])
+        self.assertEqual(self.binding, registration["binding"])
+        self.assertEqual(AUTHORITY, registration["authority"])
+        self.assertEqual(self.grant["lease_ttl_s"], registration["lease_ttl_s"])
+        self.assertEqual(1, registration["rpc_limit"])
+        self.assertEqual(.7, registration["rpc_timeout_s"])
+
+        envelope = self.envelope("provider.poll", provider=True)
+        request = asyncio.create_task(self.post("/api/service-authorities/call", envelope))
+        message = await socket.receive_json(timeout=1)
+        busy = await self.post("/api/service-authorities/call", envelope)
+        self.assertEqual(429, busy.status)
+        await busy.read()
+        await self.reply(socket, message)
+        completed = await request
+        self.assertEqual(200, completed.status)
+        await completed.read()
+
     async def test_rpc_budget_requires_a_positive_finite_number(self):
         for value in (0, -1, True, "20", float("inf"), float("nan")):
             with self.subTest(value=value):
