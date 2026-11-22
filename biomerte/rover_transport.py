@@ -100,6 +100,21 @@ class _VisionObservations:
         return value
 
 
+def _offer_vision(pending, message, observation, *, same_clock=False, new_group=False):
+    """Append without blocking, coalescing known observations between reliable records."""
+    if (observation is None or new_group or not pending
+            or not isinstance(pending[-1], _VisionObservations)):
+        if len(pending) >= 8:
+            return False
+        if observation is None:
+            pending.append(message)
+            return True
+        pending.append(_VisionObservations())
+    key, processed = observation
+    pending[-1].put(key, message, processed if same_clock else None)
+    return True
+
+
 class _VisionRelayBuffer:
     """Coalesce live observations between ordered records without splitting a message."""
 
@@ -114,15 +129,8 @@ class _VisionRelayBuffer:
                 message = await local.receive()
                 observation = _vision_observation(message)
                 async with self.changed:
-                    if observation is None:
-                        await self.changed.wait_for(lambda: len(self.pending) < 8)
-                        self.pending.append(message)
-                    else:
-                        if not self.pending or not isinstance(self.pending[-1], _VisionObservations):
-                            await self.changed.wait_for(lambda: len(self.pending) < 8)
-                            self.pending.append(_VisionObservations())
-                        key, processed = observation
-                        self.pending[-1].put(key, message, processed if same_clock else None)
+                    while not _offer_vision(self.pending, message, observation, same_clock=same_clock):
+                        await self.changed.wait()
                     self.changed.notify_all()
                 if message.type in (WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR):
                     return
@@ -196,7 +204,7 @@ async def splice(first, second, receive_first=None, receive_second=None):
 
 
 class _PublicVision:
-    """Bound raw observations admitted to the public TCP connection per peer."""
+    """Bound observations admitted to each public TCP connection until receipt."""
 
     # Mark each writer-sized batch. Two batches can be in flight so a fast
     # peer can keep reading one while confirming the preceding batch.
@@ -205,6 +213,9 @@ class _PublicVision:
 
     def __init__(self, client):
         self.client = client
+        # Compressed peers carry more application bytes within one network
+        # round trip. Four ordinary 64 KiB records can advance between receipts.
+        self.receipt_batch = self.batch_bytes * (2 if client.compress else 1)
         self.sent = self.marked = self.confirmed = 0
         self.marks = {}
         self.credit = asyncio.Event()
@@ -224,28 +235,25 @@ class _PublicVision:
             else:
                 return message
 
-    async def relay(self, upstream):
-        if self.client.compress:
-            await splice(upstream, self.client, receive_second=self.read_client)
-            return
-        pending = _VisionRelayBuffer()
+    async def relay(self, upstream, *, buffered=False):
+        pending = upstream if buffered else _VisionRelayBuffer()
         # The upstream processed timestamps belong to the Mac's monotonic clock.
-        collector = asyncio.create_task(pending.collect(upstream, same_clock=False))
+        collector = None if buffered else asyncio.create_task(pending.collect(upstream, same_clock=False))
         try:
             async def next_message():
                 # copy_socket finished writing the previous message. Place the
                 # marker after those bytes on that same ordered connection.
-                if self.sent - self.marked >= self.batch_bytes:
+                if self.sent - self.marked >= self.receipt_batch:
                     token = uuid.uuid4().bytes
                     self.marks[token] = self.marked = self.sent
                     await self.client.ping(token)
-                if self.sent - self.confirmed >= 2 * self.batch_bytes:
+                if self.sent - self.confirmed >= 2 * self.receipt_batch:
                     # A chatty peer that never confirms delivery cannot hold
                     # its provider lane indefinitely. Client PING/TEXT do not
                     # grant send credit or extend this deadline.
                     try:
                         async with asyncio.timeout(self.receipt_timeout):
-                            while self.sent - self.confirmed >= 2 * self.batch_bytes:
+                            while self.sent - self.confirmed >= 2 * self.receipt_batch:
                                 self.credit.clear()
                                 await self.credit.wait()
                     except TimeoutError:
@@ -261,8 +269,9 @@ class _PublicVision:
 
             await splice(upstream, self.client, next_message, self.read_client)
         finally:
-            collector.cancel()
-            await asyncio.gather(collector, return_exceptions=True)
+            if collector is not None:
+                collector.cancel()
+                await asyncio.gather(collector, return_exceptions=True)
 
 
 class Ingress:
@@ -275,6 +284,14 @@ class Ingress:
         self.lanes = {}
         self.active = set()
         self.limit = limit
+        self.site_vision = None
+        self.vision_viewers = set()
+        self.vision_lanes = set()
+
+    def full(self):
+        # Count every authorized viewer even after its temporary origin closes.
+        shared_without_lane = max(0, len(self.vision_viewers) - len(self.vision_lanes))
+        return len(self.pending) + len(self.lanes) + shared_without_lane >= self.limit
 
     def authenticate(self, request, token, prefix):
         if not hmac.compare_digest(request.headers.get('Authorization', ''), prefix + token):
@@ -302,8 +319,10 @@ class Ingress:
             for future in list(self.pending.values()) + list(self.lanes.values()):
                 if not future.done():
                     future.set_exception(ConnectionError('Rover bridge disconnected'))
-            await asyncio.gather(*(s.close(code=1011, message=b'Rover bridge lost')
-                                   for s in list(self.active)), return_exceptions=True)
+            # Dropping the control TCP connection may cancel this HTTP handler
+            # during cleanup. Its old-generation sockets must still be closed.
+            retiring = [s.close(code=1011, message=b'Rover bridge lost') for s in list(self.active)]
+            await asyncio.shield(asyncio.gather(*retiring, return_exceptions=True))
         return socket
 
     async def data(self, request):
@@ -314,6 +333,9 @@ class Ingress:
         socket = web.WebSocketResponse(heartbeat=15, max_msg_size=0,
                                        writer_limit=65536)
         await socket.prepare(request)
+        if future.done() or self.lanes.get(request.match_info['id']) is not future:
+            await socket.close(code=1008, message=b'Rover opener already gone')
+            return socket
         finished = asyncio.get_running_loop().create_future()
         future.set_result((socket, finished))
         try:
@@ -330,7 +352,7 @@ class Ingress:
             raise web.HTTPNotFound()
         if self.link is None or self.link.closed:
             raise web.HTTPServiceUnavailable(text='Rover service disconnected')
-        if len(self.pending) + len(self.lanes) >= self.limit:
+        if self.full():
             raise web.HTTPTooManyRequests()
         identity = uuid.uuid4().hex
         future = asyncio.get_running_loop().create_future()
@@ -380,47 +402,67 @@ class Ingress:
         return await self.live(request, {'type':'native_open','path':request.path,
                                         'authorization':authorization}, 0)
 
+    @contextlib.asynccontextmanager
+    async def open_live_lane(self, link, notice, *, shared=False):
+        lane_id = uuid.uuid4().hex
+        future = asyncio.get_running_loop().create_future()
+        self.lanes[lane_id] = future
+        if shared:
+            self.vision_lanes.add(lane_id)
+        upstream = finished = None
+        try:
+            await link.send_json({**notice, 'id': lane_id})
+            upstream, finished = await asyncio.wait_for(future, 10)
+            self.active.add(upstream)
+            yield upstream
+        finally:
+            self.lanes.pop(lane_id, None)
+            self.vision_lanes.discard(lane_id)
+            # Cancellation may win immediately after /rover/data resolved the
+            # future but before the awaiting origin reader resumed.
+            if upstream is None and future.done() and not future.cancelled():
+                if future.exception() is None:
+                    upstream, finished = future.result()
+            if finished is not None and not finished.done():
+                finished.set_result(None)
+            if upstream is not None:
+                self.active.discard(upstream)
+                await upstream.close()
+            if self.link is link and not link.closed:
+                await link.send_json({'type': 'cancel', 'id': lane_id})
+
     async def live(self, request, notice, maximum):
         if request.headers.get('Upgrade', '').lower() != 'websocket':
             raise web.HTTPBadRequest()
         if self.link is None or self.link.closed:
             raise web.HTTPServiceUnavailable()
-        if len(self.pending) + len(self.lanes) >= self.limit:
+        if self.full():
             raise web.HTTPTooManyRequests()
-        identity = uuid.uuid4().hex
-        future = asyncio.get_running_loop().create_future()
-        self.lanes[identity] = future
-        finished = upstream = None
-        try:
-            await self.link.send_json({**notice,'id':identity})
-            upstream, finished = await asyncio.wait_for(future, 10)
+        if (notice['type'] == 'open' and notice['path'] == '/api/live/vision'
+                and 'shared_site_vision_v1' in self.capabilities):
+            from .shared_site_vision import SharedSiteVision
+            if self.site_vision is None or self.site_vision.bridge is not self.link or self.site_vision.ended:
+                self.site_vision = SharedSiteVision(self, self.link)
+            return await self.site_vision.serve(request, maximum)
+        async with self.open_live_lane(self.link, notice) as upstream:
             vision = notice['type'] == 'open' and notice['path'] == '/api/live/vision'
             socket = web.WebSocketResponse(heartbeat=LIVE_HEARTBEAT_SECONDS, autoping=not vision,
                                            max_msg_size=maximum, writer_limit=65536)
             await socket.prepare(request)
-            self.active.update((upstream, socket))
+            self.active.add(socket)
             try:
                 if vision:
                     await _PublicVision(socket).relay(upstream)
                 else:
                     await splice(upstream, socket)
             finally:
-                self.active.discard(upstream)
                 self.active.discard(socket)
             return socket
-        finally:
-            self.lanes.pop(identity, None)
-            if finished is not None and not finished.done():
-                finished.set_result(None)
-            if upstream is not None:
-                await upstream.close()
-            if self.link is not None and not self.link.closed:
-                await self.link.send_json({'type':'cancel', 'id':identity})
 
     async def inspect(self, authority, session):
         if self.link is None or self.link.closed:
             raise ConnectionError('Authority bridge disconnected')
-        if len(self.pending)+len(self.lanes)>=self.limit:
+        if self.full():
             raise ConnectionError('Authority bridge busy')
         identity=uuid.uuid4().hex
         future=asyncio.get_running_loop().create_future()
@@ -442,7 +484,7 @@ class Ingress:
 
 
 class Outbound:
-    def __init__(self, public, local, secret, native_router=None):
+    def __init__(self, public, local, secret, native_router=None, *, shared_site_vision=False):
         self.public = public.rstrip('/')
         self.local = local.rstrip('/')
         self.headers = {'Authorization':'Bridge ' + derived(secret, 'rover-link')}
@@ -450,8 +492,11 @@ class Outbound:
         self.tasks = {}
         self.inspect_token = derived(secret,'router-inspect')
         self.native_router = local_router(native_router)
-        if self.native_router:
-            self.headers['X-Bridge-Capabilities'] = 'native_router,owner_inspect'
+        capabilities = ['native_router', 'owner_inspect'] if self.native_router else []
+        if shared_site_vision:
+            capabilities.append('shared_site_vision_v1')
+        if capabilities:
+            self.headers['X-Bridge-Capabilities'] = ','.join(capabilities)
 
     async def open_native(self, session, value):
         if not self.native_router or not re.fullmatch(r'/[a-f0-9]{32}/[a-z_]+', value['path']):

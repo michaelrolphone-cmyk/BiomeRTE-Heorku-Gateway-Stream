@@ -117,14 +117,43 @@ class PublicVisionFlow(unittest.IsolatedAsyncioTestCase):
         await self.expect(client, WSMsgType.BINARY, data)
         await self.expect(client, WSMsgType.PING)
 
-    async def test_negotiated_vision_and_map_keep_existing_data_and_ping_behavior(self):
-        for lane, compress in [("vision", 15), ("map", 0)]:
-            raw, client = await self.open(lane, compress)
-            for value in (b"x" * 200000, b"second", b"third"):
-                await raw.send_bytes(value)
-                await self.expect(client, WSMsgType.BINARY, value)
-            await client.ping(b"browser")
-            await self.expect(client, WSMsgType.PONG, b"browser")
+    async def test_map_keeps_existing_data_and_ping_behavior(self):
+        raw, client = await self.open("map")
+        for value in (b"x" * 200000, b"second", b"third"):
+            await raw.send_bytes(value)
+            await self.expect(client, WSMsgType.BINARY, value)
+        await client.ping(b"browser")
+        await self.expect(client, WSMsgType.PONG, b"browser")
+
+    async def test_negotiated_viewer_confirms_compressed_delivery_before_replaying_samples(self):
+        upstream, client = await self.open(compress=15)
+        self.assertTrue(client.compress)
+        # This complete world exceeds a compressed viewer's application-byte
+        # window. Reading only its header is insufficient to grant credit.
+        world = wire_frame({"type": "world_snapshot", "data": "z" * 300000}, b"")
+        await upstream.send_bytes(world)
+        await self.expect(client, WSMsgType.BINARY, world)
+        marker = await self.expect(client, WSMsgType.PING)
+        tail_collected = asyncio.Event()
+        receive = web.WebSocketResponse.receive
+
+        async def observe_tail(socket, *args, **kwargs):
+            message = await receive(socket, *args, **kwargs)
+            if message.type == WSMsgType.TEXT and message.data == "ordered tail":
+                tail_collected.set()
+            return message
+
+        self.enterContext(patch.object(web.WebSocketResponse, "receive", observe_tail))
+        for serial in range(14):
+            await upstream.send_bytes(record(str(serial), "frame", "front"))
+        await upstream.send_str("ordered tail")
+        await asyncio.wait_for(tail_collected.wait(), 2)
+        # An unrelated client ping remains responsive while video is held.
+        await client.ping(b"browser")
+        await self.expect(client, WSMsgType.PONG, b"browser")
+        await client.pong(marker)
+        await self.expect(client, WSMsgType.BINARY, record("13", "frame", "front"))
+        await self.expect(client, WSMsgType.TEXT, "ordered tail")
 
     async def test_stalled_client_pings_cannot_renew_its_credit_or_lane(self):
         self.enterContext(patch.object(rover_transport._PublicVision, "receipt_timeout", 0.2))

@@ -173,7 +173,7 @@ async def run():
     waiter=None
     try:
         await web.TCPSite(runner,'127.0.0.1',8093).start()
-        transport=asyncio.create_task(Outbound(PUBLIC,'http://127.0.0.1:8093',secret,rover.local_router).run())
+        transport=asyncio.create_task(Outbound(PUBLIC,'http://127.0.0.1:8093',secret,rover.local_router,shared_site_vision=True).run())
         waiter=asyncio.create_task(stopped.wait())
         done,unused=await asyncio.wait((transport,waiter),return_when=asyncio.FIRST_COMPLETED)
         if transport in done:await transport
