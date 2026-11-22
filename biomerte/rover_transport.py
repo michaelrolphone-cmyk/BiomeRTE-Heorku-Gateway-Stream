@@ -11,8 +11,12 @@ import hmac
 import json
 import re
 import uuid
+from time import monotonic
 from urllib.parse import urlsplit
 from aiohttp import web, ClientSession, WSMsgType, ClientError
+
+
+VISION_FRESHNESS_SECONDS = .5
 
 
 def derived(secret, purpose):
@@ -30,7 +34,7 @@ def local_router(value):
     return value.rstrip('/')
 
 
-def _vision_observation_key(message):
+def _vision_observation(message):
     if message.type != WSMsgType.BINARY:
         return None
     wire = message.data
@@ -50,11 +54,49 @@ def _vision_observation_key(message):
         return None
     kind = header.get("type")
     if kind == "frame" and end < len(wire):
-        return camera, kind
+        return (camera, kind), header.get("processed_monotonic")
     if (kind in ("sensor_tick", "telemetry") and end == len(wire)
             and header.get("sensor_tick") is True and header.get("image_available") is not True):
-        return camera, "sensor_tick"
+        return (camera, "sensor_tick"), header.get("processed_monotonic")
     return None
+
+
+class _VisionObservations:
+    """Schedule a consecutive group of observations in their original wire order."""
+
+    def __init__(self):
+        self.latest = {}
+        self.before = {}
+        self.served = {}
+        self.serial = 0
+        self.sent_through = 0
+
+    def put(self, key, message, processed):
+        self.serial += 1
+        received = monotonic()
+        stamp = processed if type(processed) in (int, float) and 0 <= processed <= received else received
+        # The four possible feed keys bound both dictionaries. Keep the last
+        # observation of each feed just before this feed's current record.
+        self.before[key] = self.latest.copy()
+        self.latest[key] = self.serial, message, stamp
+
+    def take(self):
+        # No other feed's last remaining observation may be skipped. Among
+        # records that can legally precede that boundary, let a waiting feed
+        # go before a feed which already had a later write opportunity.
+        boundary = min(self.latest, key=lambda key: self.latest[key][0])
+        chosen = boundary
+        serial, value, _ = self.latest[boundary]
+        fresh_since = monotonic() - VISION_FRESHNESS_SECONDS
+        for key, (prior_serial, prior_value, stamp) in self.before[boundary].items():
+            if (key in self.latest and prior_serial > self.sent_through and stamp >= fresh_since
+                    and self.served.get(key, 0) < self.served.get(chosen, 0)):
+                chosen, serial, value = key, prior_serial, prior_value
+        self.sent_through = self.served[chosen] = serial
+        if self.latest[chosen][0] == serial:
+            del self.latest[chosen]
+            del self.before[chosen]
+        return value
 
 
 class _VisionRelayBuffer:
@@ -69,21 +111,17 @@ class _VisionRelayBuffer:
         try:
             while True:
                 message = await local.receive()
-                key = _vision_observation_key(message)
+                observation = _vision_observation(message)
                 async with self.changed:
-                    if key is not None:
-                        # A manifest, snapshot or other ordered message is a barrier.
-                        for i in range(len(self.pending) - 1, -1, -1):
-                            prior = self.pending[i][0]
-                            if prior is None:
-                                break
-                            if prior == key:
-                                del self.pending[i]
-                                break
-                    # Ordinary observations use at most four entries between
-                    # barriers. Backpressure also bounds arbitrary reliable input.
-                    await self.changed.wait_for(lambda: len(self.pending) < 8)
-                    self.pending.append((key, message))
+                    if observation is None:
+                        await self.changed.wait_for(lambda: len(self.pending) < 8)
+                        self.pending.append(message)
+                    else:
+                        if not self.pending or not isinstance(self.pending[-1], _VisionObservations):
+                            await self.changed.wait_for(lambda: len(self.pending) < 8)
+                            self.pending.append(_VisionObservations())
+                        key, processed = observation
+                        self.pending[-1].put(key, message, processed)
                     self.changed.notify_all()
                 if message.type in (WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR):
                     return
@@ -97,7 +135,13 @@ class _VisionRelayBuffer:
             await self.changed.wait_for(lambda: self.pending or self.error is not None)
             if not self.pending:
                 raise self.error
-            _, message = self.pending.popleft()
+            group = self.pending[0]
+            if isinstance(group, _VisionObservations):
+                message = group.take()
+                if not group.latest:
+                    self.pending.popleft()
+            else:
+                message = self.pending.popleft()
             self.changed.notify_all()
             return message
 

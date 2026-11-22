@@ -18,7 +18,7 @@ from biomerte.identity import sign
 from biomerte.rover import Rover
 from biomerte.control_clock import ControlClock
 from biomerte.service_routing import ServiceOwnerResolver
-from rover_transport import Outbound, derived, local_router
+from rover_transport import Outbound, VISION_FRESHNESS_SECONDS, derived, local_router
 from site_bridge import SiteBridge
 from rover_routes import ControllerRoutes
 
@@ -116,7 +116,7 @@ class FreshRover(Rover):
             processed = metadata.get('processed_monotonic')
             # Provider and server share this Mac's monotonic clock. This bound
             # is explicitly processing-to-server, not camera capture latency.
-            if type(processed) not in (float,int) or not 0 <= time.monotonic()-processed <= .5:
+            if type(processed) not in (float,int) or not 0 <= time.monotonic()-processed <= VISION_FRESHNESS_SECONDS:
                 return
         super().broadcast(lane, message)
 
