@@ -1,4 +1,4 @@
-name: Verify external fence wait
+name: Gateway qualification
 
 on:
   push:
@@ -19,7 +19,7 @@ jobs:
           python-version: "3.12"
       - name: Install test dependencies
         run: python -m pip install --disable-pip-version-check -r requirements.txt
-      - name: Verify waiting, activation, coordinator and transport
+      - name: Verify the complete gateway, controller transport and Mac bridge suite
         env:
           PYTHONPATH: tests
-        run: python -m unittest -v test_external_fence_wait test_service_activation test_service_coordinator test_service_transport test_checkpoint_service_scope test_public_server test_durable_witness test_witness_deployment test_controller_runtime_transport
+        run: python -m unittest discover -s tests -v
