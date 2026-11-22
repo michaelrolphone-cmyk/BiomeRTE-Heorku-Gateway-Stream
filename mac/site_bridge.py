@@ -285,7 +285,15 @@ class SiteBridge:
 
         app = web.Application(middlewares=[authenticate], client_max_size=0)
         app.router.add_post('/api/led', self.camera_light.handle)
-        from video_jobs import VideoJobs, video_handler
+        try:
+            from video_jobs import VideoJobs, video_handler
+        except ModuleNotFoundError as error:
+            if error.name != "video_jobs":
+                raise
+            if __package__:
+                from .recorded_video.video_jobs import VideoJobs, video_handler
+            else:
+                from recorded_video.video_jobs import VideoJobs, video_handler
         from pathlib import Path
         app['video_jobs'] = VideoJobs(Path.home() / '.local/share/biome-robot-vision')
         app.router.add_post('/api/video', video_handler)
