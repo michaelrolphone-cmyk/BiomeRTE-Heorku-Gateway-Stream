@@ -136,8 +136,9 @@ class Coordinator:
         if (demand is not None) != (state == "lease_scoped"):
             raise ValueError("Capability demand requires the lease_scoped state policy")
         if demand is not None:
-            if (not isinstance(demand, dict) or set(demand) != DEMAND_FIELDS or
-                    any(not isinstance(v, str) or not 0 < len(v) <= 192 for v in demand.values()) or
+            if (not isinstance(demand, dict) or set(demand) not in (DEMAND_FIELDS, DEMAND_FIELDS | {"slot"}) or
+                    any(not isinstance(demand[k], str) or not 0 < len(demand[k]) <= 192 for k in DEMAND_FIELDS) or
+                    ("slot" in demand and (type(demand["slot"]) is not int or demand["slot"] < 0)) or
                     not REVISION.fullmatch(demand["controller"]) or
                     not REVISION.fullmatch(demand["provider"])):
                 raise ValueError("capability_lease requires exact controller, provider, resource and contract")
