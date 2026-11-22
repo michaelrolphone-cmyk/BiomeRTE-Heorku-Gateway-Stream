@@ -570,7 +570,19 @@ class Coordinator:
 
     def _summary(self, service_id, item, now):
         grant = item["grant"]
-        return dict(service_id=service_id,
+        observation = {}
+        if item["manifest"].get("capability_lease"):
+            sample = item.get("demand")
+            current = sample and sample[0] == item["manifest"]["revision"]
+            remaining = max(0, sample[2] - now) if current else 0
+            if not current:
+                state = "unobserved"
+            elif not remaining:
+                state = "stale"
+            else:
+                state = "leased" if sample[1] else "idle"
+            observation["capability_demand"] = dict(state=state, fresh_for_s=remaining)
+        return dict(**observation, service_id=service_id,
             manifest_revision=item["manifest"]["revision"],
             state=item["reason"],
             conflicting_revisions=sorted(item.get("conflicting_revisions", ())),
