@@ -11,7 +11,7 @@ import re
 import uuid
 from urllib.parse import urlsplit
 
-from aiohttp import ClientTimeout
+from aiohttp import ClientError, ClientTimeout
 
 PROTOCOL = "biomerte-durable-witness/1"
 HASH = re.compile("[0-9a-f]{64}")
@@ -52,13 +52,14 @@ class DurableWitness:
         self.witness_id, self.lease_s, self.timeout = witness_id, lease_s, timeout
         self.boot_id, self.epoch, self.deadline = uuid.uuid4().hex, None, 0
         self.loaded_epoch = None
+        self.closed = False
         self.heads, self.pending = {}, {}
         self.lock, self.task = asyncio.Lock(), None
-        coordinator.witness_deadline = lambda: self.deadline
+        coordinator.witness_deadline = lambda: 0 if self.closed else self.deadline
         coordinator.publication_pending = lambda service_id: service_id in self.pending
 
     def current(self):
-        return self.epoch is not None and self.coordinator.clock() < self.deadline
+        return not self.closed and self.epoch is not None and self.coordinator.clock() < self.deadline
 
     def owner(self):
         return {"boot_id": self.boot_id, "epoch": self.epoch}
@@ -219,6 +220,8 @@ class DurableWitness:
 
     async def refresh(self):
         async with self.lock:
+            if self.closed:
+                raise WitnessError()
             await self._lease(not self.current())
             for service_id in list(self.pending):
                 await self._commit_pending(service_id)
@@ -239,8 +242,17 @@ class DurableWitness:
         self.task = asyncio.create_task(self.loop())
 
     async def close(self):
+        if self.closed:
+            return
+        self.closed = True
         if self.task:
             self.task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
                 await self.task
-        self.deadline = 0
+        async with self.lock:
+            self.deadline = 0
+            if self.epoch is not None:
+                # The successor still waits out every grant this boot could
+                # have issued. Lost replies and older witnesses fall back to TTL.
+                with contextlib.suppress(ClientError, OSError, asyncio.TimeoutError):
+                    await self.request("release", owner=self.owner())

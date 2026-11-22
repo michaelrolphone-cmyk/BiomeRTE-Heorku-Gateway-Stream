@@ -42,6 +42,9 @@ class Metadata:
         if operation == "renew":
             self.lease["expires_at"] = now + body["lease_s"]
             return dict(protocol=PROTOCOL, lease=dict(self.lease, server_now=now))
+        if operation == "release":
+            self.lease["expires_at"] = 0
+            return dict(protocol=PROTOCOL, released=True)
         if operation == "heads":
             if self.fail_heads:
                 raise asyncio.TimeoutError()
@@ -138,6 +141,33 @@ class DurableWitnessTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotEqual(old_epoch, anchor["boot_epoch"])
         self.assertGreaterEqual(restarted.boot_until - self.clock(), 10)
         self.assertIsNone(self.witness.head("example"))
+
+    async def test_clean_exit_retires_boot_but_keeps_checkpoint_and_full_grant_grace(self):
+        await self.witness.commit(packet(0, "a" * 64))
+        await self.witness.close()
+        self.assertFalse(self.witness.current())
+        restarted = Coordinator("coordinator", max_lease_ttl_s=10, clock=self.clock)
+        survivor = self.client(restarted)
+        await survivor.refresh()
+        self.assertEqual(survivor.head("example")["digest"], "a" * 64)
+        self.assertGreaterEqual(restarted.boot_until - self.clock(), 10)
+        with self.assertRaises(WitnessError):
+            await self.witness.refresh()
+
+    async def test_unknown_release_response_keeps_the_previous_expiry_protection(self):
+        request = self.witness.request
+        async def unavailable(operation, **kwargs):
+            if operation == "release":
+                raise asyncio.TimeoutError()
+            return await request(operation, **kwargs)
+        self.witness.request = unavailable
+        await self.witness.close()
+        successor = self.client(Coordinator("coordinator", max_lease_ttl_s=10, clock=self.clock))
+        with self.assertRaises(WitnessError):
+            await successor.refresh()
+        self.clock.advance(41)
+        await successor.refresh()
+        self.assertTrue(successor.current())
 
     async def test_incomplete_head_load_never_enables_a_lease_on_retry(self):
         self.clock.advance(41)
