@@ -77,6 +77,19 @@ class DurableWitnessTests(unittest.IsolatedAsyncioTestCase):
         client.request = self.metadata.request
         return client
 
+    async def test_compact_and_full_publications_share_the_same_lineage_and_retry(self):
+        await self.witness.commit(packet(1, "a" * 64))
+        target = dict(service_id="example", sequence=2, digest="b"*64, scope_digest=SCOPE)
+        with self.assertRaises(WitnessError):
+            await self.witness.commit_reference(target, "0" * 64)
+        with self.assertRaises(WitnessError):
+            await self.witness.commit_reference(dict(target, scope_digest="0"*64), "a"*64)
+        self.metadata.fail_after_commit = True
+        with self.assertRaises(asyncio.TimeoutError):
+            await self.witness.commit_reference(target, "a"*64)
+        self.assertEqual(target, await self.witness.commit(packet(2, "b"*64, "a"*64)))
+        self.assertEqual(target, self.metadata.head)
+
     async def test_http_request_identifies_client_and_preserves_authentication(self):
         answer = dict(protocol=PROTOCOL, heads=[], next=None)
         response = Mock(status=200)

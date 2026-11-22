@@ -188,8 +188,13 @@ class DurableWitness:
     async def commit(self, packet):
         payload = packet.get("payload", {})
         service_id = payload.get("service_id")
-        target = exact_head(dict(service_id=service_id, scope_digest=payload.get("scope_digest"),
-                                 sequence=payload.get("sequence"), digest=packet.get("digest")))
+        reference = dict(service_id=service_id, scope_digest=payload.get("scope_digest"),
+                         sequence=payload.get("sequence"), digest=packet.get("digest"))
+        return await self.commit_reference(reference, payload.get("previous_digest", ""))
+
+    async def commit_reference(self, reference, previous_digest):
+        target = exact_head(reference)
+        service_id = target["service_id"]
         async with self.lock:
             if not self.current():
                 raise WitnessError()
@@ -198,12 +203,12 @@ class DurableWitness:
             if previous and not same and (
                     previous["scope_digest"] != target["scope_digest"]
                     or target["sequence"] <= previous["sequence"]
-                    or payload.get("previous_digest") != previous["digest"]):
+                    or previous_digest != previous["digest"]):
                 raise WitnessError(409, {"head": previous})
             expected = ({key: previous[key] for key in ("sequence", "digest")} if previous else None)
             candidate = dict(service_id=service_id, scope_digest=target["scope_digest"],
                 checkpoint={key: target[key] for key in ("sequence", "digest")},
-                expected=expected, previous_digest=payload.get("previous_digest", ""))
+                expected=expected, previous_digest=previous_digest)
             retained = self.pending.get(service_id)
             if retained is not None:
                 if retained["checkpoint"] != candidate["checkpoint"] or retained["scope_digest"] != candidate["scope_digest"]:

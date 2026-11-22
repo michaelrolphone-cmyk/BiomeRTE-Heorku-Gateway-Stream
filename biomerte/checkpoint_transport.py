@@ -106,6 +106,14 @@ class CheckpointWorkers:
                 link["boot_epoch"] == self.coordinator.boot_epoch and
                 self.coordinator.worker_current(*key, service_id=scope))
 
+    def _require_owner_only(self, binding):
+        service_id = binding["service_id"]
+        if (not self.durable_witness or not self.durable_witness.head(service_id)
+                or any(worker != binding["worker_id"] and scope == service_id
+                       and self._current(link["key"], link, service_id)
+                       for (worker, scope), link in self.links.items())):
+            raise web.HTTPConflict(text="Full checkpoint publication required")
+
     async def _registration(self, socket, worker_id):
         """Bind a socket once. Legacy helpers prove their own nonempty scope."""
         value = await socket.receive_json()
@@ -292,13 +300,24 @@ class CheckpointWorkers:
                 service_id = binding["service_id"]
                 checkpoint = body.get("checkpoint")
                 identity = checkpoint_identity(checkpoint, service_id)
-                if not isinstance(checkpoint.get("package"), dict):
-                    raise ValueError("Signed scoped checkpoint package required")
+                compact = "witness_reference" in body
+                package = checkpoint.get("package")
                 targets = body.get("targets")
                 if not isinstance(targets, list):
                     raise ValueError("targets must list exact eligible standby identities")
                 if body.get("local_durable") is not True:
                     raise ValueError("Current owner local fsync acknowledgement required")
+                if compact:
+                    reference = body["witness_reference"]
+                    if (targets or set(checkpoint) != set(identity) or not isinstance(reference, dict)
+                            or set(reference) != {"scope_digest", "previous_digest"}):
+                        raise ValueError("Owner-only publication requires an exact witness reference and no replicas")
+                    chunk_digest(reference["scope_digest"])
+                    if reference["previous_digest"] != "":
+                        chunk_digest(reference["previous_digest"])
+                    self._require_owner_only(binding)
+                elif not isinstance(package, dict):
+                    raise ValueError("Signed scoped checkpoint package required")
                 self._check_head(identity)
                 keys = [worker_identity(target) for target in targets]
                 if (len(set(keys)) != len(keys) or
@@ -317,7 +336,13 @@ class CheckpointWorkers:
                     acknowledgements.append(dict(target, checkpoint=identity, durable=True))
                 if self.durable_witness:
                     try:
-                        await self.durable_witness.commit(checkpoint["package"])
+                        if compact:
+                            self._require_owner_only(binding)
+                            await self.durable_witness.commit_reference(
+                                dict(identity, scope_digest=reference["scope_digest"]),
+                                reference["previous_digest"])
+                        else:
+                            await self.durable_witness.commit(package)
                     except (WitnessError, asyncio.TimeoutError, OSError):
                         raise web.HTTPServiceUnavailable(text="Durable checkpoint witness unavailable")
                     if self.coordinator.preparation_binding(binding, self.coordinator.clock()) is None:
@@ -335,7 +360,9 @@ class CheckpointWorkers:
                     else:
                         self.heads[service_id] = previous
                     raise web.HTTPConflict(text="Checkpoint grant changed during durable publication")
-                if checkpoint["package"].get("payload", {}).get("state", {}).get("format") == "biomerte-controller-state/1":
+                if compact:
+                    self._require_owner_only(binding)
+                if package and package.get("payload", {}).get("state", {}).get("format") == "biomerte-controller-state/1":
                     # This authenticated notification only permits local payload
                     # GC after head publication. It is not another commit vote.
                     await asyncio.gather(*(self.rpc(target, "checkpoint.published", service_id,
@@ -345,7 +372,8 @@ class CheckpointWorkers:
                             not self.coordinator.validate_preparation(binding)["valid"]):
                         raise web.HTTPServiceUnavailable(text="Checkpoint publication epoch changed")
                 return web.json_response(dict(protocol=PROTOCOL, binding=binding,
-                    checkpoint=identity, head=self.heads[service_id], acknowledgements=acknowledgements),
+                    checkpoint=identity, head=self.heads[service_id], acknowledgements=acknowledgements,
+                    owner_only_witness_reference=self.durable_witness is not None),
                     headers={"Cache-Control": "no-store"})
             service_id = body.get("service_id")
             if not isinstance(service_id, str) or not service_id:
