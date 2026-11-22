@@ -5,10 +5,10 @@ import struct
 import unittest
 from unittest.mock import patch
 
-from aiohttp import ClientSession, ClientWebSocketResponse, WSServerHandshakeError, WSMsgType, web
+from aiohttp import WSMessage, ClientSession, ClientWebSocketResponse, WSServerHandshakeError, WSMsgType, web
 from aiohttp.test_utils import TestServer
 
-from biomerte.rover_transport import Outbound
+from biomerte.rover_transport import Outbound, _VisionRelayBuffer
 
 
 def record(identity, kind="frame", camera="front"):
@@ -162,3 +162,79 @@ class VisionUplinkFreshness(unittest.IsolatedAsyncioTestCase):
             await task
         self.assertEqual(failure.exception.status, 403)
         await asyncio.wait_for(self.local_closed.wait(), 2)
+
+
+class VisionRelayScheduling(unittest.IsolatedAsyncioTestCase):
+    async def make_buffer(self):
+        source = asyncio.Queue()
+        class Local:
+            receive = source.get
+
+        relay = _VisionRelayBuffer()
+        collector = asyncio.create_task(relay.collect(Local()))
+
+        async def stop():
+            collector.cancel()
+            await asyncio.gather(collector, return_exceptions=True)
+        self.addAsyncCleanup(stop)
+
+        async def deliver(offers):
+            for value in offers:
+                source.put_nowait(WSMessage(WSMsgType.BINARY, value, None))
+            # Give the actual relay reader the offered burst before the
+            # next simulated transport write completes.
+            while not source.empty():
+                await asyncio.sleep(0)
+
+        return relay, deliver
+
+    async def assert_turns(self, feeds):
+        relay, deliver = await self.make_buffer()
+        delivered = []
+        for cycle in range(24):
+            offers = [record(f"{cycle * len(feeds) + n}", kind, camera)
+                      for n, (kind, camera) in enumerate(feeds)]
+            await deliver(offers)
+            wire = (await relay.receive()).data
+            header = json.loads(wire[4:4 + int.from_bytes(wire[:4], "big")])
+            delivered.append(int(header["frame_id"]))
+        self.assertEqual(delivered, sorted(set(delivered)))
+        counts = [sum(seq % len(feeds) == n for seq in delivered) for n in range(len(feeds))]
+        self.assertEqual(counts, [24 // len(feeds)] * len(feeds))
+
+    async def test_replacing_latest_cannot_starve_a_waiting_jpeg(self):
+        await self.assert_turns([("sensor_tick", "rear"), ("frame", "front")])
+
+    async def test_every_camera_and_kind_gets_write_opportunities(self):
+        await self.assert_turns([("sensor_tick", "front"), ("frame", "rear"),
+                                 ("sensor_tick", "rear"), ("frame", "front")])
+
+    async def test_slow_write_refreshes_the_other_waiting_camera(self):
+        relay, deliver = await self.make_buffer()
+        ticks = [record(str(i), "sensor_tick", "rear") for i in range(24)]
+        jpegs = [record(str(i), "frame", "front") for i in range(24)]
+        await deliver([ticks[0], jpegs[0]])
+        self.assertEqual((await relay.receive()).data, ticks[0])
+        for i in range(1, 24):
+            await deliver([ticks[i], jpegs[i]])
+        # The new JPEG immediately preceding the last pending tick is the
+        # newest that can be sent first without reordering or losing that tick.
+        self.assertEqual((await relay.receive()).data, jpegs[-2])
+        self.assertEqual((await relay.receive()).data, ticks[-1])
+        self.assertEqual((await relay.receive()).data, jpegs[-1])
+
+    async def test_stale_alternative_does_not_replay_after_a_long_blocked_write(self):
+        now = 100.
+        self.enterContext(patch("biomerte.rover_transport.monotonic", side_effect=lambda: now))
+        relay, deliver = await self.make_buffer()
+        old_tick = record("served", "sensor_tick", "rear")
+        old = record("stale", "frame", "front")
+        await deliver([old_tick, old])
+        self.assertEqual((await relay.receive()).data, old_tick)
+        waiting_tick = record("only-remaining-tick", "sensor_tick", "rear")
+        await deliver([waiting_tick])
+        now += 5.
+        fresh = record("fresh", "frame", "front")
+        await deliver([fresh])
+        self.assertEqual((await relay.receive()).data, waiting_tick)
+        self.assertEqual((await relay.receive()).data, fresh)

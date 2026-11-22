@@ -11,8 +11,13 @@ import hmac
 import json
 import re
 import uuid
+from time import monotonic
 from urllib.parse import urlsplit
 from aiohttp import web, ClientSession, WSMsgType, ClientError
+
+
+VISION_FRESHNESS_SECONDS = .5
+LIVE_HEARTBEAT_SECONDS = 15
 
 
 def derived(secret, purpose):
@@ -30,7 +35,7 @@ def local_router(value):
     return value.rstrip('/')
 
 
-def _vision_observation_key(message):
+def _vision_observation(message):
     if message.type != WSMsgType.BINARY:
         return None
     wire = message.data
@@ -50,11 +55,49 @@ def _vision_observation_key(message):
         return None
     kind = header.get("type")
     if kind == "frame" and end < len(wire):
-        return camera, kind
+        return (camera, kind), header.get("processed_monotonic")
     if (kind in ("sensor_tick", "telemetry") and end == len(wire)
             and header.get("sensor_tick") is True and header.get("image_available") is not True):
-        return camera, "sensor_tick"
+        return (camera, "sensor_tick"), header.get("processed_monotonic")
     return None
+
+
+class _VisionObservations:
+    """Schedule a consecutive group of observations in their original wire order."""
+
+    def __init__(self):
+        self.latest = {}
+        self.before = {}
+        self.served = {}
+        self.serial = 0
+        self.sent_through = 0
+
+    def put(self, key, message, processed):
+        self.serial += 1
+        received = monotonic()
+        stamp = processed if type(processed) in (int, float) and 0 <= processed <= received else received
+        # The four possible feed keys bound both dictionaries. Keep the last
+        # observation of each feed just before this feed's current record.
+        self.before[key] = self.latest.copy()
+        self.latest[key] = self.serial, message, stamp
+
+    def take(self):
+        # No other feed's last remaining observation may be skipped. Among
+        # records that can legally precede that boundary, let a waiting feed
+        # go before a feed which already had a later write opportunity.
+        boundary = min(self.latest, key=lambda key: self.latest[key][0])
+        chosen = boundary
+        serial, value, _ = self.latest[boundary]
+        fresh_since = monotonic() - VISION_FRESHNESS_SECONDS
+        for key, (prior_serial, prior_value, stamp) in self.before[boundary].items():
+            if (key in self.latest and prior_serial > self.sent_through and stamp >= fresh_since
+                    and self.served.get(key, 0) < self.served.get(chosen, 0)):
+                chosen, serial, value = key, prior_serial, prior_value
+        self.sent_through = self.served[chosen] = serial
+        if self.latest[chosen][0] == serial:
+            del self.latest[chosen]
+            del self.before[chosen]
+        return value
 
 
 class _VisionRelayBuffer:
@@ -65,25 +108,21 @@ class _VisionRelayBuffer:
         self.changed = asyncio.Condition()
         self.error = None
 
-    async def collect(self, local):
+    async def collect(self, local, *, same_clock=True):
         try:
             while True:
                 message = await local.receive()
-                key = _vision_observation_key(message)
+                observation = _vision_observation(message)
                 async with self.changed:
-                    if key is not None:
-                        # A manifest, snapshot or other ordered message is a barrier.
-                        for i in range(len(self.pending) - 1, -1, -1):
-                            prior = self.pending[i][0]
-                            if prior is None:
-                                break
-                            if prior == key:
-                                del self.pending[i]
-                                break
-                    # Ordinary observations use at most four entries between
-                    # barriers. Backpressure also bounds arbitrary reliable input.
-                    await self.changed.wait_for(lambda: len(self.pending) < 8)
-                    self.pending.append((key, message))
+                    if observation is None:
+                        await self.changed.wait_for(lambda: len(self.pending) < 8)
+                        self.pending.append(message)
+                    else:
+                        if not self.pending or not isinstance(self.pending[-1], _VisionObservations):
+                            await self.changed.wait_for(lambda: len(self.pending) < 8)
+                            self.pending.append(_VisionObservations())
+                        key, processed = observation
+                        self.pending[-1].put(key, message, processed if same_clock else None)
                     self.changed.notify_all()
                 if message.type in (WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR):
                     return
@@ -97,7 +136,13 @@ class _VisionRelayBuffer:
             await self.changed.wait_for(lambda: self.pending or self.error is not None)
             if not self.pending:
                 raise self.error
-            _, message = self.pending.popleft()
+            group = self.pending[0]
+            if isinstance(group, _VisionObservations):
+                message = group.take()
+                if not group.latest:
+                    self.pending.popleft()
+            else:
+                message = self.pending.popleft()
             self.changed.notify_all()
             return message
 
@@ -125,19 +170,99 @@ async def copy_socket(source, target, receive=None):
             raise source.exception() or ConnectionError('Socket failed')
 
 
-async def splice(first, second, receive_first=None):
+class _MissingPublicReceipt(Exception):
+    pass
+
+
+async def splice(first, second, receive_first=None, receive_second=None):
+    public_close = {}
     tasks = [asyncio.create_task(copy_socket(first, second, receive_first)),
-             asyncio.create_task(copy_socket(second, first))]
+             asyncio.create_task(copy_socket(second, first, receive_second))]
     try:
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
         for task in done:
             task.result()
+    except _MissingPublicReceipt:
+        public_close = {'code': 1013, 'message': b'Vision receiver stalled; reconnect'}
     finally:
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
-        await first.close()
-        await second.close()
+        if public_close:
+            await asyncio.gather(first.close(), second.close(**public_close))
+        else:
+            await first.close()
+            await second.close()
+
+
+class _PublicVision:
+    """Bound raw observations admitted to the public TCP connection per peer."""
+
+    # Mark each writer-sized batch. Two batches can be in flight so a fast
+    # peer can keep reading one while confirming the preceding batch.
+    batch_bytes = 65536
+    receipt_timeout = 2 * LIVE_HEARTBEAT_SECONDS
+
+    def __init__(self, client):
+        self.client = client
+        self.sent = self.marked = self.confirmed = 0
+        self.marks = {}
+        self.credit = asyncio.Event()
+
+    async def read_client(self):
+        while True:
+            message = await self.client.receive()
+            if message.type == WSMsgType.PING:
+                await self.client.pong(message.data)
+            elif message.type == WSMsgType.PONG:
+                offset = self.marks.get(bytes(message.data))
+                if offset is not None:
+                    # A peer may answer only the most recent outstanding ping.
+                    self.confirmed = offset
+                    self.marks = {key: end for key, end in self.marks.items() if end > offset}
+                    self.credit.set()
+            else:
+                return message
+
+    async def relay(self, upstream):
+        if self.client.compress:
+            await splice(upstream, self.client, receive_second=self.read_client)
+            return
+        pending = _VisionRelayBuffer()
+        # The upstream processed timestamps belong to the Mac's monotonic clock.
+        collector = asyncio.create_task(pending.collect(upstream, same_clock=False))
+        try:
+            async def next_message():
+                # copy_socket finished writing the previous message. Place the
+                # marker after those bytes on that same ordered connection.
+                if self.sent - self.marked >= self.batch_bytes:
+                    token = uuid.uuid4().bytes
+                    self.marks[token] = self.marked = self.sent
+                    await self.client.ping(token)
+                if self.sent - self.confirmed >= 2 * self.batch_bytes:
+                    # A chatty peer that never confirms delivery cannot hold
+                    # its provider lane indefinitely. Client PING/TEXT do not
+                    # grant send credit or extend this deadline.
+                    try:
+                        async with asyncio.timeout(self.receipt_timeout):
+                            while self.sent - self.confirmed >= 2 * self.batch_bytes:
+                                self.credit.clear()
+                                await self.credit.wait()
+                    except TimeoutError:
+                        raise _MissingPublicReceipt from None
+                # Select only after capacity returns: a newer sample may have
+                # arrived during the wait. A complete message is indivisible.
+                message = await pending.receive()
+                if message.type == WSMsgType.BINARY:
+                    self.sent += len(message.data)
+                elif message.type == WSMsgType.TEXT:
+                    self.sent += len(message.data.encode('utf-8'))
+                return message
+
+            await splice(upstream, self.client, next_message, self.read_client)
+        finally:
+            collector.cancel()
+            await asyncio.gather(collector, return_exceptions=True)
 
 
 class Ingress:
@@ -269,11 +394,16 @@ class Ingress:
         try:
             await self.link.send_json({**notice,'id':identity})
             upstream, finished = await asyncio.wait_for(future, 10)
-            socket = web.WebSocketResponse(heartbeat=15, max_msg_size=maximum, writer_limit=65536)
+            vision = notice['type'] == 'open' and notice['path'] == '/api/live/vision'
+            socket = web.WebSocketResponse(heartbeat=LIVE_HEARTBEAT_SECONDS, autoping=not vision,
+                                           max_msg_size=maximum, writer_limit=65536)
             await socket.prepare(request)
             self.active.update((upstream, socket))
             try:
-                await splice(upstream, socket)
+                if vision:
+                    await _PublicVision(socket).relay(upstream)
+                else:
+                    await splice(upstream, socket)
             finally:
                 self.active.discard(upstream)
                 self.active.discard(socket)
