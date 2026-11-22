@@ -4,6 +4,7 @@ Each live lane uses its own outbound connection. The control link carries only
 attachment notices and bounded HTTP requests; no video crosses that link.
 """
 import asyncio
+from collections import deque
 import contextlib
 import hashlib
 import hmac
@@ -29,9 +30,82 @@ def local_router(value):
     return value.rstrip('/')
 
 
-async def copy_socket(source, target):
+def _vision_observation_key(message):
+    if message.type != WSMsgType.BINARY:
+        return None
+    wire = message.data
+    if len(wire) < 5:
+        return None
+    end = 4 + int.from_bytes(wire[:4], "big")
+    if not 4 < end <= len(wire):
+        return None
+    try:
+        header = json.loads(wire[4:end])
+    except (ValueError, UnicodeError, RecursionError):
+        return None
+    if not isinstance(header, dict):
+        return None
+    camera = header.get("camera_id")
+    if camera not in ("front", "rear") or not isinstance(header.get("frame_id"), str) or not header["frame_id"]:
+        return None
+    kind = header.get("type")
+    if kind == "frame" and end < len(wire):
+        return camera, kind
+    if (kind in ("sensor_tick", "telemetry") and end == len(wire)
+            and header.get("sensor_tick") is True and header.get("image_available") is not True):
+        return camera, "sensor_tick"
+    return None
+
+
+class _VisionRelayBuffer:
+    """Coalesce live observations between ordered records without splitting a message."""
+
+    def __init__(self):
+        self.pending = deque()
+        self.changed = asyncio.Condition()
+        self.error = None
+
+    async def collect(self, local):
+        try:
+            while True:
+                message = await local.receive()
+                key = _vision_observation_key(message)
+                async with self.changed:
+                    if key is not None:
+                        # A manifest, snapshot or other ordered message is a barrier.
+                        for i in range(len(self.pending) - 1, -1, -1):
+                            prior = self.pending[i][0]
+                            if prior is None:
+                                break
+                            if prior == key:
+                                del self.pending[i]
+                                break
+                    # Ordinary observations use at most four entries between
+                    # barriers. Backpressure also bounds arbitrary reliable input.
+                    await self.changed.wait_for(lambda: len(self.pending) < 8)
+                    self.pending.append((key, message))
+                    self.changed.notify_all()
+                if message.type in (WSMsgType.CLOSE, WSMsgType.CLOSED, WSMsgType.ERROR):
+                    return
+        except Exception as exc:
+            async with self.changed:
+                self.error = exc
+                self.changed.notify_all()
+
+    async def receive(self):
+        async with self.changed:
+            await self.changed.wait_for(lambda: self.pending or self.error is not None)
+            if not self.pending:
+                raise self.error
+            _, message = self.pending.popleft()
+            self.changed.notify_all()
+            return message
+
+
+async def copy_socket(source, target, receive=None):
+    read = receive or source.receive
     while True:
-        message = await source.receive()
+        message = await read()
         if message.type == WSMsgType.BINARY:
             await target.send_bytes(message.data)
         elif message.type == WSMsgType.TEXT:
@@ -51,8 +125,8 @@ async def copy_socket(source, target):
             raise source.exception() or ConnectionError('Socket failed')
 
 
-async def splice(first, second):
-    tasks = [asyncio.create_task(copy_socket(first, second)),
+async def splice(first, second, receive_first=None):
+    tasks = [asyncio.create_task(copy_socket(first, second, receive_first)),
              asyncio.create_task(copy_socket(second, first))]
     try:
         done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -262,10 +336,20 @@ class Outbound:
     async def open(self, session, identity, path):
         async with session.ws_connect(self.local + path, headers=self.site_headers,
                                       heartbeat=15, max_msg_size=0) as local:
-            async with session.ws_connect(self.public + '/rover/data/' + identity,
-                                          headers=self.headers, heartbeat=15,
-                                          max_msg_size=0) as remote:
-                await splice(local, remote)
+            pending = _VisionRelayBuffer() if path == "/api/live/vision" else None
+            collector = asyncio.create_task(pending.collect(local)) if pending is not None else None
+            try:
+                # Negotiate compression for the large JSON headers and world
+                # bootstrap on the WAN link. Peers may decline the extension.
+                async with session.ws_connect(self.public + '/rover/data/' + identity,
+                                              headers=self.headers, heartbeat=15,
+                                              max_msg_size=0,
+                                              compress=15 if path == '/api/live/vision' else 0) as remote:
+                    await splice(local, remote, pending.receive if pending is not None else None)
+            finally:
+                if collector is not None:
+                    collector.cancel()
+                    await asyncio.gather(collector, return_exceptions=True)
 
     async def request(self, session, link, value):
         # Every HTTP response gets its own bounded, backpressured connection.

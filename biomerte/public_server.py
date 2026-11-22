@@ -1,5 +1,6 @@
 """Heroku public ingress: native streams plus reverse Mac Rover transport."""
 import asyncio
+import signal
 from aiohttp import ClientSession, web, WSMsgType
 from .stream_router import Router, _inspect, service_routes
 from .rover_transport import Ingress
@@ -124,24 +125,34 @@ def application(config):
             await durable.close()
             if durable.session:
                 await durable.session.close()
-        await authorities.close()
-        await services.close()
-        await checkpoints.close()
+        uplink = ingress.link
+        closes = [authorities.close(), services.close(), checkpoints.close()]
+        if uplink is not None:
+            closes.append(uplink.close(code=1001, message=b'Gateway stopped'))
+        await asyncio.gather(*closes)
         await asyncio.gather(*(s.close('Router stopped') for s in list(router.sessions.values())),
                              return_exceptions=True)
         tasks = list(router.tasks.values())
         for task in tasks:
             task.cancel()
         await asyncio.gather(*tasks,return_exceptions=True)
-    app.on_cleanup.append(close)
+    # Revoke admission and retire the exact durable owner before aiohttp
+    # waits for long-lived reverse links and WebSocket requests to finish.
+    app.on_shutdown.append(close)
     return app
 
 
 async def serve(config):
     runner = web.AppRunner(application(config))
-    await runner.setup()
+    stopped = asyncio.Event()
+    loop = asyncio.get_running_loop()
+    loop.add_signal_handler(signal.SIGTERM, stopped.set)
     try:
+        await runner.setup()
         await web.TCPSite(runner, config.get('listen','0.0.0.0'), config['port']).start()
-        await asyncio.Future()
+        await stopped.wait()
     finally:
-        await runner.cleanup()
+        try:
+            await runner.cleanup()
+        finally:
+            loop.remove_signal_handler(signal.SIGTERM)

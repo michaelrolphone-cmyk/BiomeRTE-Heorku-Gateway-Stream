@@ -142,7 +142,8 @@ class ServiceAuthorities:
                 return socket
             scope = self.scopes()[service_id]
             await socket.send_json(dict(type="registered", protocol=PROTOCOL,
-                binding=binding, authority=scope["id"], lease_ttl_s=grant["lease_ttl_s"]))
+                binding=binding, authority=scope["id"], lease_ttl_s=grant["lease_ttl_s"],
+                rpc_limit=self.limit, rpc_timeout_s=self.rpc_timeout))
             link["registered"] = True
             async for message in socket:
                 if message.type != WSMsgType.TEXT:

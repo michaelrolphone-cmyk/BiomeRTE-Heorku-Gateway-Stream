@@ -127,7 +127,10 @@ It uses the coordinator Bearer credential, then sends:
 
 The registration acknowledgement contains `type: registered`,
 `protocol: biomerte-service-authority/1`, B, the logical authority ID, and the
-remaining placement TTL. Only the current complete grant may register. An
+remaining placement TTL. The gateway also reports its shared pending RPC limit in
+`rpc_limit` and its reply timeout in seconds in `rpc_timeout_s`. These values
+are upper bounds shared with other callers. Older gateways omit both fields.
+Only the current complete grant may register. An
 obsolete connection cannot replace the admitted connection.
 
 Registration retains a 5-second deadline. Application RPC replies have a separate
