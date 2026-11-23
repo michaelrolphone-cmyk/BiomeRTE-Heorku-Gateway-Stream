@@ -204,6 +204,27 @@ class ResolverTests(unittest.TestCase):
             self.assertEqual(MAC, envelope["controller"])
             self.assertEqual({"id": "lease"}, result)
 
+    def test_site_calls_follow_gateway_after_native_custody_freeze(self):
+        local = runtime_class("LocalAuthority")(self.home, self.home)
+        auth = {"actor": "5" * 64, "signature": "original"}
+
+        def request(operation, realm="site"):
+            with patch("urllib.request.urlopen", return_value=Reply(b'{"result":{}}')) as send:
+                local.call(operation, {"session": "current"}, "request", auth=auth,
+                           controller=MAC, realm=realm)
+            return send.call_args.args[0]
+
+        self.assertEqual("http://127.0.0.1:8740/v1/call", request("cap.discover").full_url)
+        (self.home / "controller-authority.json").touch()
+        for operation in ("cap.discover", "cap.lease", "stream.attach", "stream.inspect"):
+            sent = request(operation)
+            self.assertEqual("https://site.example/v1/call", sent.full_url)
+            envelope = json.loads(sent.data)
+            self.assertEqual(MAC, envelope["controller"])
+            self.assertEqual(auth, envelope["auth"])
+        self.assertEqual("http://127.0.0.1:8740/v1/call",
+                         request("system.info", realm="local").full_url)
+
 
 if __name__ == "__main__":
     unittest.main()

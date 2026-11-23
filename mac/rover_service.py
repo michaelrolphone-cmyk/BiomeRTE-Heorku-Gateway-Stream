@@ -29,7 +29,9 @@ PUBLIC='https://biomerte-stream-gateway-e0322b2b60c9.herokuapp.com'
 class LocalAuthority:
     """Use the running controller API; never run a bundled authority on its database."""
     def __init__(self, directory, caller_home):
-        self.config = read_json(str(pathlib.Path(directory)/'node.json'))
+        directory = pathlib.Path(directory)
+        self.config = read_json(str(directory/'node.json'))
+        self.custody_marker = directory/'controller-authority.json'
         self.node = self.config['node']
         self.caller_home = pathlib.Path(caller_home)
         self.identity = read_json(str(self.caller_home/'node.json'))
@@ -39,7 +41,12 @@ class LocalAuthority:
                         arguments=arguments, id=request_id, controller=controller or self.node)
         envelope['auth'] = auth or dict(actor=self.identity['node'],
             signature=sign(str(self.caller_home/'node.key'), envelope))
-        request = urllib.request.Request('http://127.0.0.1:8740/v1/call',
+        endpoint = 'http://127.0.0.1:8740/v1/call'
+        if realm == 'site' and self.custody_marker.exists():
+            # The gateway resolves the native alias to its current managed
+            # owner. Keep the original signed alias for existing grants.
+            endpoint = GATEWAY + '/v1/call'
+        request = urllib.request.Request(endpoint,
             data=json.dumps(envelope).encode(), headers={'Content-Type':'application/json',
             'User-Agent':'BiomeRTE-Rover-Server/1'})
         with urllib.request.urlopen(request, timeout=20) as response:
